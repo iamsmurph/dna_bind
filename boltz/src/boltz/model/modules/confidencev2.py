@@ -476,14 +476,20 @@ class ConfidenceHeads(nn.Module):
         out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
 
         try:
-            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
-            )
+            (
+                ptm,
+                iptm,
+                ligand_iptm,
+                protein_iptm,
+                pair_chains_iptm,
+                tm_expected_value,
+            ) = compute_ptms(pae_logits, x_pred, feats, multiplicity)
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm
             out_dict["ligand_iptm"] = ligand_iptm
             out_dict["protein_iptm"] = protein_iptm
             out_dict["pair_chains_iptm"] = pair_chains_iptm
+            out_dict["tm_expected_value"] = tm_expected_value
         except Exception as e:
             print(f"Error in compute_ptms: {e}")
             out_dict["ptm"] = torch.zeros_like(complex_plddt)
@@ -491,5 +497,6 @@ class ConfidenceHeads(nn.Module):
             out_dict["ligand_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["protein_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["pair_chains_iptm"] = torch.zeros_like(complex_plddt)
+            out_dict["tm_expected_value"] = torch.zeros_like(complex_plddt)
 
         return out_dict

@@ -10,10 +10,11 @@ import argparse
 #%%
 df = pd.read_csv("/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_dedup_sampled.csv")
 #%%
-# Random sample 200 unique uniprot values
+# Random sample n_tfs unique uniprot values
+n_tfs = 100
 unique_uniprots = df['uniprot'].unique()
 rng = np.random.default_rng(42)  # Using a fixed seed for reproducibility
-sampled_uniprots = rng.choice(unique_uniprots, size=min(100, len(unique_uniprots)), replace=False)
+sampled_uniprots = rng.choice(unique_uniprots, size=min(n_tfs, len(unique_uniprots)), replace=False)
 
 # Subset df by those values
 df = df[df['uniprot'].isin(sampled_uniprots)]

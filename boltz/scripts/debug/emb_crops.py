@@ -1,3 +1,28 @@
+# %%
+"""
+Boltz Prediction Script - Notebook Style
+
+This script has been converted from a command-line interface to a notebook-style script
+for easier debugging and interactive use.
+
+To use this script:
+1. Modify the configuration parameters in the cell below
+2. Execute each cell in order
+3. The main prediction will run in the final cell
+
+Key parameters to modify:
+- data: Path to your input FASTA or YAML file
+- out_dir: Directory where results will be saved
+- model: "boltz1" or "boltz2"
+- accelerator: "gpu", "cpu", or "tpu"
+- Other parameters as needed for your specific use case
+"""
+
+# %%
+
+# %%
+# Imports and constants
+
 import multiprocessing
 import os
 import pickle
@@ -12,7 +37,6 @@ from pathlib import Path
 from typing import Literal, Optional
 
 
-import click
 import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
@@ -53,6 +77,9 @@ BOLTZ2_AFFINITY_URL_WITH_FALLBACK = [
     "https://model-gateway.boltz.bio/boltz2_aff.ckpt",
     "https://huggingface.co/boltz-community/boltz-2/resolve/main/boltz2_aff.ckpt",
 ]
+
+# %%
+# Data classes and configuration
 
 
 @dataclass
@@ -160,6 +187,10 @@ class BoltzSteeringParams:
     num_gd_steps: int = 20
 
 
+# %%
+# Download functions
+
+
 @rank_zero_only
 def download_boltz1(cache: Path) -> None:
     """Download all the required data.
@@ -173,19 +204,13 @@ def download_boltz1(cache: Path) -> None:
     # Download CCD
     ccd = cache / "ccd.pkl"
     if not ccd.exists():
-        click.echo(
-            f"Downloading the CCD dictionary to {ccd}. You may "
-            "change the cache directory with the --cache flag."
-        )
+        print(f"Downloading the CCD dictionary to {ccd}.")
         urllib.request.urlretrieve(CCD_URL, str(ccd))  # noqa: S310
 
     # Download model
     model = cache / "boltz1_conf.ckpt"
     if not model.exists():
-        click.echo(
-            f"Downloading the model weights to {model}. You may "
-            "change the cache directory with the --cache flag."
-        )
+        print(f"Downloading the model weights to {model}.")
         for i, url in enumerate(BOLTZ1_URL_WITH_FALLBACK):
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
@@ -211,28 +236,19 @@ def download_boltz2(cache: Path) -> None:
     mols = cache / "mols"
     tar_mols = cache / "mols.tar"
     if not tar_mols.exists():
-        click.echo(
-            f"Downloading the CCD data to {tar_mols}. "
-            "This may take a bit of time. You may change the cache directory "
-            "with the --cache flag."
+        print(
+            f"Downloading the CCD data to {tar_mols}. " "This may take a bit of time."
         )
         urllib.request.urlretrieve(MOL_URL, str(tar_mols))  # noqa: S310
     if not mols.exists():
-        click.echo(
-            f"Extracting the CCD data to {mols}. "
-            "This may take a bit of time. You may change the cache directory "
-            "with the --cache flag."
-        )
+        print(f"Extracting the CCD data to {mols}. " "This may take a bit of time.")
         with tarfile.open(str(tar_mols), "r") as tar:
             tar.extractall(cache)  # noqa: S202
 
     # Download model
     model = cache / "boltz2_conf.ckpt"
     if not model.exists():
-        click.echo(
-            f"Downloading the Boltz-2 weights to {model}. You may "
-            "change the cache directory with the --cache flag."
-        )
+        print(f"Downloading the Boltz-2 weights to {model}.")
         for i, url in enumerate(BOLTZ2_URL_WITH_FALLBACK):
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
@@ -246,10 +262,7 @@ def download_boltz2(cache: Path) -> None:
     # Download affinity model
     affinity_model = cache / "boltz2_aff.ckpt"
     if not affinity_model.exists():
-        click.echo(
-            f"Downloading the Boltz-2 affinity weights to {affinity_model}. You may "
-            "change the cache directory with the --cache flag."
-        )
+        print(f"Downloading the Boltz-2 affinity weights to {affinity_model}.")
         for i, url in enumerate(BOLTZ2_AFFINITY_URL_WITH_FALLBACK):
             try:
                 urllib.request.urlretrieve(url, str(affinity_model))  # noqa: S310
@@ -281,6 +294,10 @@ def get_cache_path() -> str:
     return str(Path("~/.boltz").expanduser())
 
 
+# %%
+# Input processing and validation functions
+
+
 def check_inputs(data: Path) -> list[Path]:
     """Check the input data and output directory.
 
@@ -295,7 +312,7 @@ def check_inputs(data: Path) -> list[Path]:
         The list of input data.
 
     """
-    click.echo("Checking input data.")
+    print("Checking input data.")
 
     # Check if data is a directory
     if data.is_dir():
@@ -357,10 +374,10 @@ def filter_inputs_structure(
             "if any. If you wish to override these existing "
             "predictions, please set the --override flag."
         )
-        click.echo(msg)
+        print(msg)
     elif existing and override:
         msg = f"Found {len(existing)} existing predictions, will override."
-        click.echo(msg)
+        print(msg)
 
     return manifest
 
@@ -387,7 +404,7 @@ def filter_inputs_affinity(
         The manifest of the filtered input data.
 
     """
-    click.echo("Checking input data for affinity.")
+    print("Checking input data for affinity.")
 
     # Get all affinity targets
     existing = {
@@ -407,10 +424,10 @@ def filter_inputs_affinity(
             "if any. If you wish to override these existing "
             "affinity predictions, please set the --override flag."
         )
-        click.echo(msg)
+        print(msg)
     elif existing and override:
         msg = "Found existing affinity predictions, will override."
-        click.echo(msg)
+        print(msg)
 
     return manifest
 
@@ -450,9 +467,9 @@ def compute_msa(
         Custom header value for API key authentication (overrides --api_key if set).
 
     """
-    click.echo(f"Calling MSA server for target {target_id} with {len(data)} sequences")
-    click.echo(f"MSA server URL: {msa_server_url}")
-    click.echo(f"MSA pairing strategy: {msa_pairing_strategy}")
+    print(f"Calling MSA server for target {target_id} with {len(data)} sequences")
+    print(f"MSA server URL: {msa_server_url}")
+    print(f"MSA pairing strategy: {msa_pairing_strategy}")
 
     # Construct auth headers if API key header/value is provided
     auth_headers = None
@@ -460,11 +477,11 @@ def compute_msa(
         key = api_key_header if api_key_header else "X-API-Key"
         value = api_key_value
         auth_headers = {"Content-Type": "application/json", key: value}
-        click.echo(f"Using API key authentication for MSA server (header: {key})")
+        print(f"Using API key authentication for MSA server (header: {key})")
     elif msa_server_username and msa_server_password:
-        click.echo("Using basic authentication for MSA server")
+        print("Using basic authentication for MSA server")
     else:
-        click.echo("No authentication provided for MSA server")
+        print("No authentication provided for MSA server")
 
     if len(data) > 1:
         paired_msas = run_mmseqs2(
@@ -584,7 +601,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
 
         if to_generate:
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
-            click.echo(msg)
+            print(msg)
             compute_msa(
                 data=to_generate,
                 target_id=target_id,
@@ -733,11 +750,9 @@ def process_inputs(
 
         # Nothing to do, update the manifest and return
         if data:
-            click.echo(
-                f"Found {len(existing)} existing processed inputs, skipping them."
-            )
+            print(f"Found {len(existing)} existing processed inputs, skipping them.")
         else:
-            click.echo("All inputs are already processed.")
+            print("All inputs are already processed.")
             updated_manifest = Manifest(existing)
             updated_manifest.dump(out_dir / "processed" / "manifest.json")
 
@@ -793,7 +808,7 @@ def process_inputs(
 
     # Parse input data
     preprocessing_threads = min(preprocessing_threads, len(data))
-    click.echo(f"Processing {len(data)} inputs with {preprocessing_threads} threads.")
+    print(f"Processing {len(data)} inputs with {preprocessing_threads} threads.")
 
     if preprocessing_threads > 1 and len(data) > 1:
         with Pool(preprocessing_threads) as pool:
@@ -808,252 +823,11 @@ def process_inputs(
     manifest.dump(out_dir / "processed" / "manifest.json")
 
 
-@click.group()
-def cli() -> None:
-    """Boltz."""
-    return
+# %%
+# Main prediction function
 
 
-@cli.command()
-@click.argument("data", type=click.Path(exists=True))
-@click.option(
-    "--out_dir",
-    type=click.Path(exists=False),
-    help="The path where to save the predictions.",
-    default="./",
-)
-@click.option(
-    "--cache",
-    type=click.Path(exists=False),
-    help=(
-        "The directory where to download the data and model. "
-        "Default is ~/.boltz, or $BOLTZ_CACHE if set."
-    ),
-    default=get_cache_path,
-)
-@click.option(
-    "--checkpoint",
-    type=click.Path(exists=True),
-    help="An optional checkpoint, will use the provided Boltz-1 model by default.",
-    default=None,
-)
-@click.option(
-    "--devices",
-    type=int,
-    help="The number of devices to use for prediction. Default is 1.",
-    default=1,
-)
-@click.option(
-    "--accelerator",
-    type=click.Choice(["gpu", "cpu", "tpu"]),
-    help="The accelerator to use for prediction. Default is gpu.",
-    default="gpu",
-)
-@click.option(
-    "--recycling_steps",
-    type=int,
-    help="The number of recycling steps to use for prediction. Default is 3.",
-    default=3,
-)
-@click.option(
-    "--sampling_steps",
-    type=int,
-    help="The number of sampling steps to use for prediction. Default is 200.",
-    default=200,
-)
-@click.option(
-    "--diffusion_samples",
-    type=int,
-    help="The number of diffusion samples to use for prediction. Default is 1.",
-    default=1,
-)
-@click.option(
-    "--max_parallel_samples",
-    type=int,
-    help="The maximum number of samples to predict in parallel. Default is None.",
-    default=5,
-)
-@click.option(
-    "--step_scale",
-    type=float,
-    help=(
-        "The step size is related to the temperature at "
-        "which the diffusion process samples the distribution. "
-        "The lower the higher the diversity among samples "
-        "(recommended between 1 and 2). "
-        "Default is 1.638 for Boltz-1 and 1.5 for Boltz-2. "
-        "If not provided, the default step size will be used."
-    ),
-    default=None,
-)
-@click.option(
-    "--write_full_pae",
-    type=bool,
-    is_flag=True,
-    help="Whether to dump the pae into a npz file. Default is True.",
-)
-@click.option(
-    "--write_full_pde",
-    type=bool,
-    is_flag=True,
-    help="Whether to dump the pde into a npz file. Default is False.",
-)
-@click.option(
-    "--output_format",
-    type=click.Choice(["pdb", "mmcif"]),
-    help="The output format to use for the predictions. Default is mmcif.",
-    default="mmcif",
-)
-@click.option(
-    "--num_workers",
-    type=int,
-    help="The number of dataloader workers to use for prediction. Default is 2.",
-    default=2,
-)
-@click.option(
-    "--override",
-    is_flag=True,
-    help="Whether to override existing found predictions. Default is False.",
-)
-@click.option(
-    "--seed",
-    type=int,
-    help="Seed to use for random number generator. Default is None (no seeding).",
-    default=None,
-)
-@click.option(
-    "--use_msa_server",
-    is_flag=True,
-    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
-)
-@click.option(
-    "--msa_server_url",
-    type=str,
-    help="MSA server url. Used only if --use_msa_server is set. ",
-    default="https://api.colabfold.com",
-)
-@click.option(
-    "--msa_pairing_strategy",
-    type=str,
-    help=(
-        "Pairing strategy to use. Used only if --use_msa_server is set. "
-        "Options are 'greedy' and 'complete'"
-    ),
-    default="greedy",
-)
-@click.option(
-    "--msa_server_username",
-    type=str,
-    help="MSA server username for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_USERNAME environment variable.",
-    default=None,
-)
-@click.option(
-    "--msa_server_password",
-    type=str,
-    help="MSA server password for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_PASSWORD environment variable.",
-    default=None,
-)
-@click.option(
-    "--api_key_header",
-    type=str,
-    help="Custom header key for API key authentication (default: X-API-Key).",
-    default=None,
-)
-@click.option(
-    "--api_key_value",
-    type=str,
-    help="Custom header value for API key authentication.",
-    default=None,
-)
-@click.option(
-    "--use_potentials",
-    is_flag=True,
-    help="Whether to use potentials for steering. Default is False.",
-)
-@click.option(
-    "--model",
-    default="boltz2",
-    type=click.Choice(["boltz1", "boltz2"]),
-    help="The model to use for prediction. Default is boltz2.",
-)
-@click.option(
-    "--method",
-    type=str,
-    help="The method to use for prediction. Default is None.",
-    default=None,
-)
-@click.option(
-    "--preprocessing-threads",
-    type=int,
-    help="The number of threads to use for preprocessing. Default is 1.",
-    default=multiprocessing.cpu_count(),
-)
-@click.option(
-    "--affinity_mw_correction",
-    is_flag=True,
-    type=bool,
-    help="Whether to add the Molecular Weight correction to the affinity value head.",
-)
-@click.option(
-    "--sampling_steps_affinity",
-    type=int,
-    help="The number of sampling steps to use for affinity prediction. Default is 200.",
-    default=200,
-)
-@click.option(
-    "--diffusion_samples_affinity",
-    type=int,
-    help="The number of diffusion samples to use for affinity prediction. Default is 5.",
-    default=5,
-)
-@click.option(
-    "--affinity_checkpoint",
-    type=click.Path(exists=True),
-    help="An optional checkpoint, will use the provided Boltz-1 model by default.",
-    default=None,
-)
-@click.option(
-    "--max_msa_seqs",
-    type=int,
-    help="The maximum number of MSA sequences to use for prediction. Default is 8192.",
-    default=8192,
-)
-@click.option(
-    "--subsample_msa",
-    is_flag=True,
-    help="Whether to subsample the MSA. Default is True.",
-)
-@click.option(
-    "--num_subsampled_msa",
-    type=int,
-    help="The number of MSA sequences to subsample. Default is 1024.",
-    default=1024,
-)
-@click.option(
-    "--no_kernels",
-    is_flag=True,
-    help="Whether to disable the kernels. Default False",
-)
-@click.option(
-    "--write_embeddings",
-    is_flag=True,
-    help=" to dump the s and z embeddings into a npz file. Default is False.",
-)
-@click.option(
-    "--write_contact_probs",
-    is_flag=True,
-    help=" to dump the contact probabilities into a npz file. Default is False.",
-)
-@click.option(
-    "--write_tm_expected_value",
-    is_flag=True,
-    help=" to dump the tm_expected_value matrix (N, N) into a npz file. Default is False.",
-)
-@click.option(
-    "--write_cropped_embeddings",
-    is_flag=True,
-    help=" to dump the cropped embeddings into a npz file. Default is False.",
-)
+# %%
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1095,12 +869,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     no_kernels: bool = False,
     write_embeddings: bool = False,
     write_cropped_embeddings: bool = False,
+    protein_dna_interaction_embedding_crop: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
-        click.echo(msg)
+        print(msg)
 
     # Supress some lightning warnings
     warnings.filterwarnings(
@@ -1138,13 +913,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         if api_key_value is None:
             api_key_value = os.environ.get("MSA_API_KEY_VALUE")
 
-        click.echo(f"MSA server enabled: {msa_server_url}")
+        print(f"MSA server enabled: {msa_server_url}")
         if api_key_value:
-            click.echo("MSA server authentication: using API key header")
+            print("MSA server authentication: using API key header")
         elif msa_server_username and msa_server_password:
-            click.echo("MSA server authentication: using basic auth")
+            print("MSA server authentication: using basic auth")
         else:
-            click.echo("MSA server authentication: no credentials provided")
+            print("MSA server authentication: no credentials provided")
 
     # Create output directories
     data = Path(data).expanduser()
@@ -1225,26 +1000,24 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         ),
     )
 
-    # Use file system sharing to avoid excessive shared memory FDs when spawning
-    try:
-        torch.multiprocessing.set_sharing_strategy("file_system")
-    except Exception:  # noqa: BLE001
-        pass
-
     # Set up trainer
     strategy = "auto"
-    multi_device = (isinstance(devices, int) and devices > 1) or (
+    if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
-    )
-    if multi_device:
-        # Use spawn for CUDA safety and deterministic per-rank device setup
-        strategy = DDPStrategy(start_method="spawn")
+    ):
+        start_method = (
+            "fork"
+            if platform.system() != "win32" and platform.system() != "Windows"
+            else "spawn"
+        )
+        start_method = "fork"
+        strategy = DDPStrategy(start_method=start_method)
         if len(filtered_manifest.records) < devices:
             msg = (
                 "Number of requested devices is greater "
                 "than the number of predictions, taking the minimum."
             )
-            click.echo(msg)
+            print(msg)
             if isinstance(devices, list):
                 devices = devices[: max(1, len(filtered_manifest.records))]
             else:
@@ -1275,26 +1048,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_format=output_format,
         boltz2=model == "boltz2",
         write_embeddings=write_embeddings,
-        write_cropped_embeddings=write_cropped_embeddings,
         write_contact_probs=write_contact_probs,
         write_tm_expected_value=write_tm_expected_value,
     )
-
-    # Choose precision safely for the detected accelerator / GPU capability
-    if model == "boltz1":
-        precision_value = 32
-    else:
-        if accelerator == "gpu" and torch.cuda.is_available():
-            try:
-                is_bf16 = torch.cuda.is_bf16_supported()
-            except AttributeError:
-                # Fallback based on compute capability (bf16 on Ampere+)
-                is_bf16 = (
-                    torch.cuda.get_device_properties(torch.device("cuda")).major >= 8
-                )
-            precision_value = "bf16-mixed" if is_bf16 else "16-mixed"
-        else:
-            precision_value = 32
 
     # Set up trainer
     trainer = Trainer(
@@ -1303,13 +1059,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=precision_value,
+        precision=32 if model == "boltz1" else "bf16-mixed",
     )
 
     if filtered_manifest.records:
         msg = f"Running structure prediction for {len(filtered_manifest.records)} input"
         msg += "s." if len(filtered_manifest.records) > 1 else "."
-        click.echo(msg)
+        print(msg)
 
         # Create data module
         if model == "boltz2":
@@ -1382,7 +1138,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
         # Print header
-        click.echo("\nPredicting property: affinity\n")
+        print("\nPredicting property: affinity\n")
 
         # Validate inputs
         manifest_filtered = filter_inputs_affinity(
@@ -1391,12 +1147,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             override=override,
         )
         if not manifest_filtered.records:
-            click.echo("Found existing affinity predictions for all inputs, skipping.")
+            print("Found existing affinity predictions for all inputs, skipping.")
             return
 
         msg = f"Running affinity prediction for {len(manifest_filtered.records)} input"
         msg += "s." if len(manifest_filtered.records) > 1 else "."
-        click.echo(msg)
+        print(msg)
 
         pred_writer = BoltzAffinityWriter(
             data_dir=processed.targets_dir,
@@ -1426,6 +1182,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_full_pde": False,
             "write_contact_probs": write_contact_probs,
             "write_tm_expected_value": write_tm_expected_value,
+            "protein_dna_interaction_embedding_crop": protein_dna_interaction_embedding_crop,
             "write_cropped_embeddings": write_cropped_embeddings,
         }
 
@@ -1460,5 +1217,143 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         )
 
 
-if __name__ == "__main__":
-    cli()
+# %%
+
+# %%
+# Run the prediction - execute this cell to run the prediction with the parameters above
+
+
+# Configuration parameters - modify these as needed for your use case
+data = "/data/rbg/users/ujp/dnabind/boltz_runs/pbm_debug_single"  # Path to your input data (FASTA or YAML file)
+out_dir = "/data/rbg/users/ujp/dnabind/boltz_runs/"  # Output directory
+# cache will be set to default value using get_cache_path() function below
+checkpoint = None  # Optional checkpoint path
+affinity_checkpoint = None  # Optional affinity checkpoint path
+devices = 1  # Number of devices to use
+accelerator = "gpu"  # Accelerator type: gpu, cpu, or tpu
+recycling_steps = 3  # Number of recycling steps
+sampling_steps = 200  # Number of sampling steps
+diffusion_samples = 1  # Number of diffusion samples
+sampling_steps_affinity = 200  # Sampling steps for affinity prediction
+diffusion_samples_affinity = 3  # Diffusion samples for affinity prediction
+max_parallel_samples = None  # Max parallel samples
+step_scale = None  # Step scale for diffusion
+write_full_pae = False  # Write full PAE to npz file
+write_full_pde = False  # Write full PDE to npz file
+write_contact_probs = False  # Write contact probabilities
+write_tm_expected_value = False  # Write TM expected value
+output_format = "mmcif"  # Output format: pdb or mmcif
+num_workers = 2  # Number of dataloader workers
+override = False  # Override existing predictions
+seed = None  # Random seed
+use_msa_server = False  # Use MSA server for MSA generation
+msa_server_url = "https://api.colabfold.com"  # MSA server URL
+msa_pairing_strategy = "greedy"  # MSA pairing strategy
+msa_server_username = None  # MSA server username
+msa_server_password = None  # MSA server password
+api_key_header = None  # API key header
+api_key_value = None  # API key value
+use_potentials = False  # Use potentials for steering
+model = "boltz2"  # Model to use: boltz1 or boltz2
+method = None  # Method for prediction
+affinity_mw_correction = False  # Molecular weight correction for affinity
+preprocessing_threads = None  # Will be set to multiprocessing.cpu_count() below
+max_msa_seqs = 8192  # Maximum MSA sequences
+subsample_msa = True  # Subsample MSA
+num_subsampled_msa = 1024  # Number of subsampled MSA sequences
+no_kernels = False  # Disable kernels
+write_embeddings = False  # Write embeddings to npz file
+protein_dna_interaction_embedding_crop = (
+    True  # Write protein-DNA interaction embeddings
+)
+
+write_cropped_embeddings = True  # Write cropped embeddings to npz file
+
+# new stuff
+
+mol_type_budget = {
+    const.chain_type_ids["DNA"]: 30,
+    const.chain_type_ids["RNA"]: 30,
+    const.chain_type_ids["PROTEIN"]: 100,
+}
+
+
+# Validate configuration - run this cell to check your parameters
+print("Configuration Summary:")
+print(f"Data path: {data}")
+print(f"Output directory: {out_dir}")
+print(f"Model: {model}")
+print(f"Accelerator: {accelerator}")
+print(f"Devices: {devices}")
+print(f"Use MSA server: {use_msa_server}")
+if use_msa_server:
+    print(f"MSA server URL: {msa_server_url}")
+print(f"Sampling steps: {sampling_steps}")
+print(f"Diffusion samples: {diffusion_samples}")
+print(f"Write embeddings: {write_embeddings}")
+# Set default values that depend on imported modules
+if preprocessing_threads is None:
+    preprocessing_threads = multiprocessing.cpu_count()
+cache = get_cache_path()  # Set cache directory
+
+# %%
+
+# Clean up previous predictions
+from pathlib import Path
+import shutil
+
+pred_dir = Path(out_dir) / ("boltz_results_" + Path(data).stem) / "predictions"
+print(f"Removing existing output directory: {pred_dir}")
+if pred_dir.exists():
+    shutil.rmtree(pred_dir)
+    print("Previous predictions deleted.")
+else:
+    print("No previous predictions to delete.")
+
+# Run the prediction
+predict(
+    data=data,
+    out_dir=out_dir,
+    cache=cache,
+    checkpoint=checkpoint,
+    affinity_checkpoint=affinity_checkpoint,
+    devices=devices,
+    accelerator=accelerator,
+    recycling_steps=recycling_steps,
+    sampling_steps=sampling_steps,
+    diffusion_samples=diffusion_samples,
+    sampling_steps_affinity=sampling_steps_affinity,
+    diffusion_samples_affinity=diffusion_samples_affinity,
+    max_parallel_samples=max_parallel_samples,
+    step_scale=step_scale,
+    write_full_pae=write_full_pae,
+    write_full_pde=write_full_pde,
+    write_contact_probs=write_contact_probs,
+    write_tm_expected_value=write_tm_expected_value,
+    output_format=output_format,
+    num_workers=num_workers,
+    override=override,
+    seed=seed,
+    use_msa_server=use_msa_server,
+    msa_server_url=msa_server_url,
+    msa_pairing_strategy=msa_pairing_strategy,
+    msa_server_username=msa_server_username,
+    msa_server_password=msa_server_password,
+    api_key_header=api_key_header,
+    api_key_value=api_key_value,
+    use_potentials=use_potentials,
+    model=model,
+    method=method,
+    affinity_mw_correction=affinity_mw_correction,
+    preprocessing_threads=preprocessing_threads,
+    max_msa_seqs=max_msa_seqs,
+    subsample_msa=subsample_msa,
+    num_subsampled_msa=num_subsampled_msa,
+    no_kernels=no_kernels,
+    write_embeddings=write_embeddings,
+    write_cropped_embeddings=write_cropped_embeddings,
+)
+
+print("Prediction completed!")
+
+# %%

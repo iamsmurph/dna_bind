@@ -24,6 +24,16 @@ from boltz.model.modules.confidencev2 import ConfidenceModule
 from boltz.model.modules.diffusion_conditioning import DiffusionConditioning
 from boltz.model.modules.diffusionv2 import AtomDiffusion
 from boltz.model.modules.encodersv2 import RelativePositionEncoder
+from boltz.model.modules.interaction_utils import (
+    cutoff_bin_mask,
+    contact_logprobs,
+    contact_scores,
+    select_with_mol_type_budget,
+    self_interaction_mask,
+    pad_interaction_mask,
+    intra_mol_type_interaction_mask,
+    DEFAULT_MOL_TYPE_BUDGET,
+)
 from boltz.model.modules.trunkv2 import (
     BFactorModule,
     ContactConditioning,
@@ -85,6 +95,7 @@ class Boltz2(LightningModule):
         ema_decay: float = 0.999,
         min_dist: float = 2.0,
         max_dist: float = 22.0,
+        distogram_contact_cutoff: float = 8.0,
         predict_args: Optional[dict[str, Any]] = None,
         fix_sym_check: bool = False,
         cyclic_pos_enc: bool = False,
@@ -104,6 +115,8 @@ class Boltz2(LightningModule):
         checkpoint_diffusion_conditioning: bool = False,
         use_templates_v2: bool = False,
         use_kernels: bool = False,
+        distogram_protein_dna_interaction_cutoff: float = 12.0,
+        mol_type_budget: dict[str, int] = DEFAULT_MOL_TYPE_BUDGET,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["validators"])
@@ -113,7 +126,9 @@ class Boltz2(LightningModule):
 
         if validate_structure:
             # Late init at setup time
-            self.val_group_mapper = {}  # maps a dataset index to a validation group name
+            self.val_group_mapper = (
+                {}
+            )  # maps a dataset index to a validation group name
             self.validator_mapper = {}  # maps a dataset index to a validator
 
             # Validators for each dataset keep track of all metrics,
@@ -301,6 +316,12 @@ class Boltz2(LightningModule):
         self.alpha_pae = alpha_pae
         self.structure_prediction_training = structure_prediction_training
 
+        self.distogram_contact_cutoff = distogram_contact_cutoff
+        self.distogram_protein_dna_interaction_cutoff = (
+            distogram_protein_dna_interaction_cutoff
+        )
+        self.mol_type_budget = mol_type_budget
+
         if self.confidence_prediction:
             self.confidence_module = ConfidenceModule(
                 token_s,
@@ -359,9 +380,11 @@ class Boltz2(LightningModule):
 
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
+
         if stage == "predict" and not (
             torch.cuda.is_available()
-            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+            and torch.cuda.get_device_properties(torch.device("cuda")).major
+            >= 8.0  # noqa: PLR2004
         ):
             self.use_kernels = False
 
@@ -457,7 +480,9 @@ class Boltz2(LightningModule):
                         # Compute pairwise stack
                         if self.use_templates:
                             if self.is_template_compiled and not self.training:
-                                template_module = self.template_module._orig_mod  # noqa: SLF001
+                                template_module = (
+                                    self.template_module._orig_mod
+                                )  # noqa: SLF001
                             else:
                                 template_module = self.template_module
 
@@ -476,7 +501,9 @@ class Boltz2(LightningModule):
 
                         # Revert to uncompiled version for validation
                         if self.is_pairformer_compiled and not self.training:
-                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                            pairformer_module = (
+                                self.pairformer_module._orig_mod
+                            )  # noqa: SLF001
                         else:
                             pairformer_module = self.pairformer_module
 
@@ -494,6 +521,59 @@ class Boltz2(LightningModule):
                 "s": s,
                 "z": z,
             }
+
+            if self.predict_args["write_contact_probs"]:
+                bin_mask = cutoff_bin_mask(
+                    distance_cutoff=self.distogram_contact_cutoff,
+                    min_dist=self.min_dist,
+                    max_dist=self.max_dist,
+                    n_bins=pdistogram.shape[-1],
+                )
+                exclude_mask = self_interaction_mask(
+                    feats["asym_id"]
+                ) | pad_interaction_mask(feats["token_pad_mask"].bool())
+                dict_out["contact_probs"] = torch.exp(
+                    contact_logprobs(
+                        pdistogram=pdistogram[:, :, :, 0],
+                        exclude_mask=exclude_mask,
+                        bin_mask=bin_mask,
+                    )
+                )
+
+            if self.predict_args["write_cropped_embeddings"]:
+                exclude_mask = (
+                    intra_mol_type_interaction_mask(
+                        feats["mol_type"], const.chain_type_ids["DNA"]
+                    )
+                    | self_interaction_mask(feats["asym_id"])
+                    | pad_interaction_mask(feats["token_pad_mask"].bool())
+                )
+                bin_mask = cutoff_bin_mask(
+                    distance_cutoff=self.distogram_protein_dna_interaction_cutoff,
+                    min_dist=self.min_dist,
+                    max_dist=self.max_dist,
+                    n_bins=pdistogram.shape[-1],
+                )
+                logprobs = contact_logprobs(
+                    pdistogram=pdistogram[:, :, :, 0],
+                    exclude_mask=exclude_mask,
+                    bin_mask=bin_mask,
+                )
+                profile = contact_scores(logprobs)
+                selected_indices = select_with_mol_type_budget(
+                    contact_profile=profile,
+                    asym_id=feats["asym_id"],
+                    mol_type=feats["mol_type"],
+                    mol_type_budget=self.mol_type_budget,
+                )
+                dict_out["cropped_embeddings"] = {}
+                for b in range(z.shape[0]):
+                    dict_out["cropped_embeddings"][b] = {}
+                    dict_out["cropped_embeddings"][b]["indices"] = selected_indices[b]
+                    dict_out["cropped_embeddings"][b]["z"] = z[b][selected_indices[b]][
+                        :, selected_indices[b]
+                    ]
+                    dict_out["cropped_embeddings"][b]["s_full"] = s
 
             if (
                 self.run_trunk_and_structure
@@ -549,9 +629,9 @@ class Boltz2(LightningModule):
 
             if self.training and self.confidence_prediction:
                 assert len(feats["coords"].shape) == 4
-                assert feats["coords"].shape[1] == 1, (
-                    "Only one conformation is supported for confidence"
-                )
+                assert (
+                    feats["coords"].shape[1] == 1
+                ), "Only one conformation is supported for confidence"
 
             # Compute structure module
             if self.training and self.structure_prediction_training:
@@ -735,9 +815,9 @@ class Boltz2(LightningModule):
 
         return_dict = {}
 
-        assert batch["coords"].shape[0] == 1, (
-            f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
-        )
+        assert (
+            batch["coords"].shape[0] == 1
+        ), f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
 
         if symmetry_correction:
             true_coords = []
@@ -863,9 +943,9 @@ class Boltz2(LightningModule):
 
             # TODO remove once multiple conformers are supported
             K = true_coords.shape[1]
-            assert K == 1, (
-                f"Confidence_prediction is not supported for num_ensembles_val={K}."
-            )
+            assert (
+                K == 1
+            ), f"Confidence_prediction is not supported for num_ensembles_val={K}."
 
             # For now, just take the only conformer.
             true_coords = true_coords.squeeze(1)  # (S, L, 3)
@@ -1073,6 +1153,13 @@ class Boltz2(LightningModule):
             pred_dict["token_masks"] = batch["token_pad_mask"]
             pred_dict["s"] = out["s"]
             pred_dict["z"] = out["z"]
+            if self.predict_args.get("write_contact_probs", False):
+                pred_dict["contact_probs"] = out["contact_probs"]
+            if self.predict_args.get("write_tm_expected_value", False):
+                pred_dict["tm_expected_value"] = out["tm_expected_value"]
+
+            if self.predict_args.get("write_cropped_embeddings", False):
+                pred_dict["cropped_embeddings"] = out["cropped_embeddings"]
 
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
@@ -1236,12 +1323,12 @@ class Boltz2(LightningModule):
             checkpoint["hyper_parameters"]["training_args"][
                 "diffusion_multiplicity"
             ] = self.training_args.diffusion_multiplicity
-            checkpoint["hyper_parameters"]["training_args"]["recycling_steps"] = (
-                self.training_args.recycling_steps
-            )
-            checkpoint["hyper_parameters"]["training_args"]["weight_decay"] = (
-                self.training_args.weight_decay
-            )
+            checkpoint["hyper_parameters"]["training_args"][
+                "recycling_steps"
+            ] = self.training_args.recycling_steps
+            checkpoint["hyper_parameters"]["training_args"][
+                "weight_decay"
+            ] = self.training_args.weight_decay
 
     def configure_callbacks(self) -> list[Callback]:
         """Configure model callbacks.

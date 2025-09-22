@@ -9,3 +9,10 @@ venv/
 
 
 .ssh/
+.cache/
+.cache/**
+
+msa+checkpoints/
+
+# ignore debug temp artifacts
+boltz/scripts/debug/*.pt

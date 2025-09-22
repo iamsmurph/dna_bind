@@ -206,9 +206,11 @@ class ConfidenceModule(nn.Module):
                         feats,
                         pred_distogram_logits,
                         multiplicity=1,
-                        s_diffusion=s_diffusion[sample_idx : sample_idx + 1]
-                        if s_diffusion is not None
-                        else None,
+                        s_diffusion=(
+                            s_diffusion[sample_idx : sample_idx + 1]
+                            if s_diffusion is not None
+                            else None
+                        ),
                         run_sequentially=False,
                         use_kernels=use_kernels,
                     )
@@ -469,13 +471,19 @@ class ConfidenceHeads(nn.Module):
         if self.compute_pae:
             out_dict["pae_logits"] = pae_logits
             out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
-            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
-            )
+            (
+                ptm,
+                iptm,
+                ligand_iptm,
+                protein_iptm,
+                pair_chains_iptm,
+                tm_expected_value,
+            ) = compute_ptms(pae_logits, x_pred, feats, multiplicity)
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm
             out_dict["ligand_iptm"] = ligand_iptm
             out_dict["protein_iptm"] = protein_iptm
             out_dict["pair_chains_iptm"] = pair_chains_iptm
+            out_dict["tm_expected_value"] = tm_expected_value
 
         return out_dict
