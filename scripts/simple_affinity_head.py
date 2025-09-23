@@ -4,12 +4,24 @@ import glob
 import os
 import random
 import sys
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 import numpy as np
 import torch
+from collections import defaultdict
+import warnings
+
+
+# Pooling hyper-parameters – updated at runtime by run()
+POOL_CFG = {
+    "topk": 256,
+    "alpha": 1.0,
+    "beta": 0.5,
+    "gamma": 0.2,
+    "tau": 0.25,
+}
 
 
 @dataclass
@@ -85,6 +97,59 @@ def locate_cropped_embeddings_file(pred_dir: str) -> str:
     return paths[0]
 
 
+def locate_best_cropped_embeddings_file(pred_dir: str) -> str:
+    paths = sorted(glob.glob(os.path.join(pred_dir, "cropped_embeddings_*.pt")))
+    if not paths:
+        raise FileNotFoundError(f"No cropped_embeddings_*.pt in {pred_dir}")
+    contact_path = _locate_contact_probs_file(pred_dir)
+    if not contact_path:
+        # Fallback to first if no contact available
+        return paths[0]
+    data = np.load(contact_path)
+    contact = data.get("contact_probs", None)
+    if contact is None:
+        contact = data[data.files[0]]
+    best_path = paths[0]
+    best_mass = -1.0
+    for p in paths:
+        try:
+            inner = _load_cropped_embeddings(p)
+            # Build full-length PD mask using indices if needed
+            if "token_is_dna" in inner:
+                is_dna = inner["token_is_dna"]
+                if isinstance(is_dna, torch.Tensor):
+                    is_dna = is_dna.detach().cpu().numpy()
+                is_dna = is_dna.astype(bool)
+                if is_dna.ndim == 1 and is_dna.shape[0] == contact.shape[0]:
+                    # already full-length
+                    is_prot = ~is_dna
+                    mask_full = np.outer(is_prot, is_dna)
+                else:
+                    # crop-level -> expand via indices
+                    if "indices" not in inner:
+                        continue
+                    indices = inner["indices"]
+                    if isinstance(indices, torch.Tensor):
+                        indices = indices.detach().cpu().numpy()
+                    indices = indices.astype(int)
+                    is_prot_crop = (~is_dna).astype(bool)
+                    is_dna_crop = is_dna.astype(bool)
+                    mask_crop = np.outer(is_prot_crop, is_dna_crop)
+                    L = contact.shape[0]
+                    mask_full = np.zeros((L, L), dtype=bool)
+                    mask_full[np.ix_(indices, indices)] = mask_crop
+            else:
+                # No metadata: use all contacts
+                mask_full = np.ones_like(contact, dtype=bool)
+            mass = float(contact[mask_full].sum())
+            if mass > best_mass:
+                best_mass = mass
+                best_path = p
+        except Exception:
+            continue
+    return best_path
+
+
 def _load_cropped_embeddings(pt_path: str) -> dict:
     obj = torch.load(pt_path, map_location="cpu")
     if isinstance(obj, dict) and 0 in obj and isinstance(obj[0], dict):
@@ -103,6 +168,11 @@ def _locate_contact_probs_file(pred_dir: str) -> str:
     return paths[0] if paths else ""
 
 
+def _locate_file(pred_dir: str, stem: str) -> str:
+    paths = glob.glob(os.path.join(pred_dir, f"{stem}_*.npz"))
+    return paths[0] if paths else ""
+
+
 def load_feature_from_pt(pt_path: str) -> np.ndarray:
     """Baseline feature: mean-pool z over (i,j) -> (128,)."""
     inner = _load_cropped_embeddings(pt_path)
@@ -113,60 +183,179 @@ def load_feature_from_pt(pt_path: str) -> np.ndarray:
     return pooled.cpu().numpy().astype(np.float32)
 
 
-def load_advanced_feature(pred_dir: str, pt_path: str, use_contact_probs: bool) -> np.ndarray:
-    """Advanced feature using z mean, contact-weighted z mean, s_full mean over crop, and mean contact.
+def load_advanced_feature(pred_dir: str, pt_path: str, use_contact_probs: bool, pool_cfg: Optional[dict] = None) -> np.ndarray:
+    """Interface-aware top-K pooled feature.
 
-    Returns a vector of size 128 (z_mean) + 128 (z_contact_mean) + 384 (s_mean_crop) + 1 (mean_contact) = 641.
-    If contact_probs are unavailable or disabled, the contact-weighted parts are zeros.
+    Returns vector dim: 3*128 + 2*384 + 3 = 1155.
     """
     inner = _load_cropped_embeddings(pt_path)
-    z: torch.Tensor = inner["z"]  # (N, N, 128)
+    z: torch.Tensor = inner["z"]  # (N,N,128)
     if z.ndim != 3:
-        raise ValueError(f"Expected z to be 3D (N, N, C); got shape {tuple(z.shape)} in {pt_path}")
-    z_mean = z.mean(dim=(0, 1)).cpu().numpy().astype(np.float32)  # (128,)
+        raise ValueError("Expected z to be 3D (N,N,C)")
+    N = z.shape[0]
+    # metadata-based PD mask
+    mask_pd = _compute_pd_mask(inner)
+    if mask_pd is None:
+        # fallback: use entire matrix
+        mask_pd = np.ones((N, N), dtype=bool)
 
-    # s_full: (1, L, 384); indices: (N,)
-    s_mean_crop = np.zeros((384,), dtype=np.float32)
-    if "s_full" in inner and "indices" in inner:
-        s_full: torch.Tensor = inner["s_full"]  # (1, L, 384)
-        indices: torch.Tensor = inner["indices"]  # (N,)
+    # edge score matrix W (normalized over PD) and raw score/contact
+    W = np.zeros((N, N), dtype=np.float32)
+    score = None
+    contact = None
+    pae = None
+    pde = None
+    # Optional crop indices
+    indices_np: Optional[np.ndarray] = None
+    if "indices" in inner:
+        idx = inner["indices"]
+        if isinstance(idx, torch.Tensor):
+            idx = idx.detach().cpu().numpy()
+        indices_np = idx.astype(int)
+    if use_contact_probs:
         try:
-            s_crop = s_full[0, indices.long(), :]  # (N, 384)
-            s_mean_crop = s_crop.mean(dim=0).cpu().numpy().astype(np.float32)
+            contact_path = _locate_file(pred_dir, "contact_probs")
+            pae_path = _locate_file(pred_dir, "pae")
+            pde_path = _locate_file(pred_dir, "pde")
+            if contact_path:
+                data = np.load(contact_path)
+                contact = data.get("contact_probs", None)
+                if contact is None:
+                    contact = data[data.files[0]]
+            # Maybe crop full matrices to the crop
+            def _maybe_crop(mat: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                if mat is None:
+                    return None
+                if mat.shape[0] == N and mat.shape[1] == N:
+                    return mat
+                if indices_np is None:
+                    return None
+                return mat[np.ix_(indices_np, indices_np)]
+
+            contact_crop = _maybe_crop(contact)
+            pae = np.load(pae_path)["arr_0"] if pae_path else None
+            pde = np.load(pde_path)["arr_0"] if pde_path else None
+            pae_crop = _maybe_crop(pae) if pae is not None else None
+            pde_crop = _maybe_crop(pde) if pde is not None else None
+
+            if contact_crop is not None:
+                cfg = POOL_CFG if pool_cfg is None else pool_cfg
+                alpha = cfg["alpha"]
+                beta = cfg["beta"]
+                gamma = cfg["gamma"]
+                tau = cfg["tau"]
+                score = (
+                    alpha * (contact_crop - tau)
+                    - beta * (pae_crop if pae_crop is not None else 0.0)
+                    - gamma * (pde_crop if pde_crop is not None else 0.0)
+                ).astype(np.float32)
+                mflat = mask_pd.flatten()
+                sflat = score.flatten()
+                sflat_masked = sflat[mflat]
+                if sflat_masked.size > 0:
+                    exp_s = np.exp(sflat_masked - np.max(sflat_masked))
+                    wflat = exp_s / max(exp_s.sum(), 1e-9)
+                    W_flat = np.zeros_like(sflat, dtype=np.float32)
+                    W_flat[mflat] = wflat
+                    W = W_flat.reshape(N, N)
+                else:
+                    W[...] = mask_pd.astype(np.float32)
+            else:
+                W[...] = mask_pd.astype(np.float32)
         except Exception:
-            s_mean_crop = s_full[0].mean(dim=0).cpu().numpy().astype(np.float32)
+            W[...] = mask_pd.astype(np.float32)
     else:
-        # fallback: no s_full/indices
+        W[...] = mask_pd.astype(np.float32)
+
+    # Select top-K edges by masked count, using score if available
+    mflat = mask_pd.flatten()
+    num_masked = int(mflat.sum())
+    cfg = POOL_CFG if pool_cfg is None else pool_cfg
+    K = min(cfg["topk"], num_masked if num_masked > 0 else N * N)
+    if K <= 0:
+        return np.zeros((3 * z.shape[-1] + 2 * 384 + 3,), dtype=np.float32)
+    base_flat = (score if score is not None else W).flatten()
+    masked_positions = np.nonzero(mflat)[0]
+    base_flat_masked = base_flat[mflat]
+    if base_flat_masked.size == 0:
+        return np.zeros((3 * z.shape[-1] + 2 * 384 + 3,), dtype=np.float32)
+    top_in_mask = np.argpartition(base_flat_masked, -K)[-K:]
+    top_idx = masked_positions[top_in_mask]
+    # weights normalized over top-K
+    W_flat = W.flatten()
+    weights = W_flat[top_idx][:, None]
+    weights_sum = float(weights.sum())
+    if weights_sum <= 0:
+        weights = np.full_like(weights, 1.0 / max(K, 1), dtype=np.float32)
+    else:
+        weights = weights / weights_sum
+    z_flat = z.detach().cpu().numpy().astype(np.float32).reshape(-1, z.shape[-1])  # (N*N,C)
+    Zk = z_flat[top_idx]  # (K,C)
+    # stats
+    z_wmean = (weights * Zk).sum(0)
+    z_wmax = Zk.max(0)
+    z_wstd = np.sqrt((weights * (Zk - z_wmean) ** 2).sum(0))
+
+    # Token pools using s_full if available
+    s_prot_pool = np.zeros((384,), dtype=np.float32)
+    s_dna_pool = np.zeros((384,), dtype=np.float32)
+    if "s_full" in inner and "indices" in inner and "token_is_dna" in inner:
+        s_full = inner["s_full"]
+        if isinstance(s_full, torch.Tensor):
+            s_full = s_full.detach().cpu().numpy()
+        if s_full.ndim == 3 and s_full.shape[0] == 1:
+            s_full = s_full[0]
+        indices_np = inner["indices"]
+        if isinstance(indices_np, torch.Tensor):
+            indices_np = indices_np.detach().cpu().numpy()
+        indices_np = indices_np.astype(int)
+        is_dna_full = inner["token_is_dna"]
+        if isinstance(is_dna_full, torch.Tensor):
+            is_dna_full = is_dna_full.detach().cpu().numpy()
+        is_dna_full = is_dna_full.astype(bool)
+        is_prot_full = ~is_dna_full
+        rows = top_idx // N
+        cols = top_idx % N
+        token_set = set(rows.tolist() + cols.tolist())
+        token_idx = np.array(sorted(token_set), dtype=int)
+        full_idx = indices_np[token_idx]
+        prot_mask_tokens = is_prot_full[full_idx]
+        dna_mask_tokens = is_dna_full[full_idx]
+        if prot_mask_tokens.any():
+            s_prot_pool = s_full[full_idx[prot_mask_tokens]].mean(0).astype(np.float32)
+        if dna_mask_tokens.any():
+            s_dna_pool = s_full[full_idx[dna_mask_tokens]].mean(0).astype(np.float32)
+
+    # mean contact and median pae/pde from selected edges if available
+    mean_contact = np.array([0.0], dtype=np.float32)
+    rows = top_idx // N
+    cols = top_idx % N
+    try:
+        if 'contact_crop' in locals() and contact_crop is not None:
+            mean_contact = np.array([contact_crop[rows, cols].mean()], dtype=np.float32)
+    except Exception:
+        pass
+    # For pae/pde medians
+    median_pae = np.array([0.0], dtype=np.float32)
+    median_pde = np.array([0.0], dtype=np.float32)
+    try:
+        if use_contact_probs and 'pae_crop' in locals() and pae_crop is not None:
+            median_pae[...] = np.median(pae_crop[rows, cols]).astype(np.float32)
+        if use_contact_probs and 'pde_crop' in locals() and pde_crop is not None:
+            median_pde[...] = np.median(pde_crop[rows, cols]).astype(np.float32)
+    except Exception:
         pass
 
-    # Contact-weighted z pooling
-    z_contact_mean = np.zeros((z.shape[-1],), dtype=np.float32)
-    mean_contact = np.zeros((1,), dtype=np.float32)
-    if use_contact_probs and "indices" in inner:
-        contact_path = _locate_contact_probs_file(pred_dir)
-        if contact_path:
-            try:
-                data = np.load(contact_path)
-                # try common keys, fallback to first array
-                if "contact_probs" in data:
-                    contact = data["contact_probs"]
-                else:
-                    # get the first array-like entry
-                    first_key = next(k for k in data.files)
-                    contact = data[first_key]
-                indices_np = inner["indices"].detach().cpu().numpy().astype(np.int64)
-                W = contact[np.ix_(indices_np, indices_np)].astype(np.float32)  # (N, N)
-                W_sum = float(W.sum())
-                mean_contact[...] = np.array([W.mean() if W.size > 0 else 0.0], dtype=np.float32)
-                if W_sum > 0:
-                    # weight z by W
-                    z_np = z.detach().cpu().numpy().astype(np.float32)  # (N, N, C)
-                    z_weighted = (z_np * W[:, :, None]).sum(axis=(0, 1)) / W_sum
-                    z_contact_mean = z_weighted.astype(np.float32)
-            except Exception:
-                pass
-
-    feature = np.concatenate([z_mean, z_contact_mean, s_mean_crop, mean_contact], axis=0)
+    feature = np.concatenate([
+        z_wmean,
+        z_wmax,
+        z_wstd,
+        s_prot_pool,
+        s_dna_pool,
+        mean_contact,
+        median_pae,
+        median_pde,
+    ], axis=0).astype(np.float32)
     return feature
 
 
@@ -177,6 +366,7 @@ def build_dataset(
     workers: int = 0,
     advanced_pooling: bool = False,
     use_contact_probs: bool = False,
+    pool_cfg: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Scan prediction dirs, load features, and assemble X, y, groups (uniprot).
 
@@ -197,7 +387,7 @@ def build_dataset(
             # skip if we cannot find label
             continue
         try:
-            pt_path = locate_cropped_embeddings_file(d)
+            pt_path = locate_best_cropped_embeddings_file(d)
         except FileNotFoundError:
             continue
         records.append(Record(uniprot=uniprot, sequence=sequence, score_from_dirname=score, z_path=pt_path, pred_dir=d))
@@ -215,7 +405,8 @@ def build_dataset(
         success: List[bool] = [False] * len(records)
         with ProcessPoolExecutor(max_workers=workers) as ex:
             if advanced_pooling:
-                future_to_idx = {ex.submit(load_advanced_feature, r.pred_dir, r.z_path, use_contact_probs): i for i, r in enumerate(records)}
+                cfg_copy = (POOL_CFG if pool_cfg is None else pool_cfg).copy()
+                future_to_idx = {ex.submit(load_advanced_feature, r.pred_dir, r.z_path, use_contact_probs, cfg_copy): i for i, r in enumerate(records)}
             else:
                 future_to_idx = {ex.submit(load_feature_from_pt, r.z_path): i for i, r in enumerate(records)}
             for fut in as_completed(future_to_idx):
@@ -235,7 +426,7 @@ def build_dataset(
         for r in records:
             try:
                 if advanced_pooling:
-                    feat = load_advanced_feature(r.pred_dir, r.z_path, use_contact_probs)
+                    feat = load_advanced_feature(r.pred_dir, r.z_path, use_contact_probs, pool_cfg)
                 else:
                     feat = load_feature_from_pt(r.z_path)
             except Exception:
@@ -300,14 +491,16 @@ class LinearHead(torch.nn.Module):
 
 
 class MLPHead(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int = 1, hidden: int = 256) -> None:
+    def __init__(self, input_dim: int, output_dim: int = 1, hidden: int = 256, dropout: float = 0.1) -> None:
         super().__init__()
         self.output_dim = output_dim
         self.net = torch.nn.Sequential(
             torch.nn.Linear(input_dim, hidden),
             torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden, 64),
             torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
             torch.nn.Linear(64, output_dim),
         )
 
@@ -317,32 +510,44 @@ class MLPHead(torch.nn.Module):
 
 def train_epoch(
     model: torch.nn.Module,
-    X: np.ndarray,
-    y: np.ndarray,
-    lr: float,
+    X_t: torch.Tensor,
+    y_t: torch.Tensor,
+    opt: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    batch_size: int = 256,
+    grad_clip: float = 1.0,
     predict_binary: bool = False,
-    y_bin: Optional[np.ndarray] = None,
+    y_bin: Optional[torch.Tensor] = None,
     bce_weight: float = 0.3,
 ) -> float:
+    """Train for one epoch using mini-batches."""
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
     mse_loss_fn = torch.nn.MSELoss()
     bce_loss_fn = torch.nn.BCEWithLogitsLoss()
-    X_t = torch.from_numpy(X)
-    y_t = torch.from_numpy(y)
-    pred = model(X_t)
-    if pred.ndim == 1:
-        pred = pred.unsqueeze(-1)
-    reg_pred = pred[:, 0]
-    loss = mse_loss_fn(reg_pred, y_t)
-    if predict_binary and y_bin is not None:
-        yb_t = torch.from_numpy(y_bin)
-        bin_pred = pred[:, 1]
-        loss = loss + bce_weight * bce_loss_fn(bin_pred, yb_t)
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    opt.step()
-    return float(loss.item())
+    n = X_t.size(0)
+    total_loss = 0.0
+    nbatches = 0
+    for i in range(0, n, batch_size):
+        xb = X_t[i : i + batch_size]
+        yb = y_t[i : i + batch_size]
+        pred = model(xb)
+        if pred.ndim == 1:
+            pred = pred.unsqueeze(-1)
+        reg_pred = pred[:, 0]
+        loss = mse_loss_fn(reg_pred, yb)
+        if predict_binary and y_bin is not None:
+            ybb = y_bin[i : i + batch_size]
+            bin_pred = pred[:, 1]
+            loss = loss + bce_weight * bce_loss_fn(bin_pred, ybb)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        if scheduler is not None:
+            scheduler.step()
+        total_loss += float(loss.item())
+        nbatches += 1
+    return total_loss / max(1, nbatches)
 
 
 @torch.inference_mode()
@@ -385,6 +590,26 @@ def spearmanr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(rx * ry))
 
 
+def _compute_pd_mask(inner: dict) -> Optional[np.ndarray]:
+    """Return boolean (N,N) mask where True = protein row & DNA col edges.
+    Tries to use metadata; returns None if cannot determine.
+    """
+    def _as_numpy(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        return x
+    if "token_is_dna" in inner:
+        is_dna = _as_numpy(inner["token_is_dna"]).astype(bool)
+    elif "entity_type" in inner:
+        et = _as_numpy(inner["entity_type"])  # assume 0=protein,1=DNA or similar
+        is_dna = (et == 1)
+    else:
+        return None
+    is_prot = ~is_dna
+    mask = np.outer(is_prot, is_dna)
+    return mask
+
+
 def run(args: argparse.Namespace) -> None:
     set_seed(args.seed)
 
@@ -394,6 +619,15 @@ def run(args: argparse.Namespace) -> None:
     print("[INFO] Scanning predictions under:", args.pred_root)
     if args.workers and args.workers > 0:
         print(f"[INFO] Parallel feature extraction with workers={args.workers}")
+    # Prepare pooling config from CLI overrides BEFORE building dataset
+    POOL_CFG.update({
+        "topk": args.topk,
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "gamma": args.gamma,
+        "tau": args.tau,
+    })
+
     X, y, groups = build_dataset(
         args.pred_root,
         labels_map,
@@ -401,8 +635,11 @@ def run(args: argparse.Namespace) -> None:
         workers=args.workers,
         advanced_pooling=args.advanced_pooling,
         use_contact_probs=args.use_contact_probs,
+        pool_cfg=POOL_CFG,
     )
     print(f"[INFO] Loaded dataset: X={X.shape}, y={y.shape}, groups={len(groups)}")
+
+    # POOL_CFG already updated before dataset build so workers use overrides
 
     # Determine unique groups and adjust folds if necessary
     unique_groups_count = len(set(groups))
@@ -425,6 +662,12 @@ def run(args: argparse.Namespace) -> None:
             train_idx = train_idx[:-1]
         folds = [(train_idx, val_idx)]
 
+    if args.audit_sample:
+        sample_keys = random.sample(list(labels_map.keys()), k=min(20, len(labels_map)))
+        print("[AUDIT] Sample key-label pairs:")
+        for k in sample_keys:
+            print(k, labels_map[k])
+
     all_metrics: List[Tuple[float, float, float]] = []
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         X_train, y_train = X[train_idx], y[train_idx]
@@ -439,8 +682,27 @@ def run(args: argparse.Namespace) -> None:
         model: torch.nn.Module
         if args.model == "linear":
             model = LinearHead(input_dim, output_dim=output_dim)
-        else:
-            model = MLPHead(input_dim, output_dim=output_dim, hidden=args.hidden_dim)
+        elif args.model == "mlp":
+            model = MLPHead(input_dim, output_dim=output_dim, hidden=args.hidden_dim, dropout=args.dropout)
+        elif args.model == "ridge":
+            try:
+                from sklearn.linear_model import RidgeCV
+            except ImportError:
+                raise RuntimeError("scikit-learn is required for --model ridge")
+            alphas = np.logspace(-6, 3, 10)
+            ridge = RidgeCV(alphas=alphas, cv=3)
+            ridge.fit(X_train, y_train)
+            y_pred = ridge.predict(X_val).astype(np.float32)
+            m_mse = mse(y_val, y_pred)
+            m_r2 = r2(y_val, y_pred)
+            m_s = spearmanr(y_val, y_pred)
+            print(f"[FOLD {fold_idx+1}] Ridge MSE={m_mse:.4f} R2={m_r2:.4f} Spearman={m_s:.4f}")
+            all_metrics.append((m_mse, m_r2, m_s))
+            continue  # skip torch training path
+
+        # Move data to tensors once
+        X_train_t = torch.from_numpy(X_train)
+        y_train_t = torch.from_numpy(y_train)
 
         # Prepare binary labels if needed
         y_bin_train: Optional[np.ndarray] = None
@@ -451,18 +713,36 @@ def run(args: argparse.Namespace) -> None:
                 threshold = float(args.binary_threshold)
             y_bin_train = (y_train >= threshold).astype(np.float32)
 
+        # Optimizer & scheduler outside epoch loop
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        total_steps = args.epochs * math.ceil(len(X_train) / args.batch_size)
+        warmup_steps = min(args.warmup_steps, total_steps // 10)
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            # Cosine decay
+            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
         for epoch in range(args.epochs):
             loss = train_epoch(
                 model,
-                X_train,
-                y_train,
-                lr=args.lr,
+                X_train_t,
+                y_train_t,
+                opt,
+                scheduler=scheduler,
+                batch_size=args.batch_size,
+                grad_clip=args.grad_clip,
                 predict_binary=args.predict_binary,
-                y_bin=y_bin_train,
+                y_bin=torch.from_numpy(y_bin_train) if y_bin_train is not None else None,
                 bce_weight=args.bce_weight,
             )
             if (epoch + 1) % max(1, args.epochs // 5) == 0:
-                print(f"[FOLD {fold_idx+1}] epoch {epoch+1}/{args.epochs} loss={loss:.4f}")
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"[FOLD {fold_idx+1}] epoch {epoch+1}/{args.epochs} loss={loss:.4f} lr={current_lr:.2e}")
 
         y_pred = predict(model, X_val)
         m_mse = mse(y_val, y_pred)
@@ -470,6 +750,16 @@ def run(args: argparse.Namespace) -> None:
         m_s = spearmanr(y_val, y_pred)
         print(f"[FOLD {fold_idx+1}] MSE={m_mse:.4f} R2={m_r2:.4f} Spearman={m_s:.4f}")
         all_metrics.append((m_mse, m_r2, m_s))
+
+        # Per-TF Spearman
+        tf_scores = []
+        val_groups = np.array(groups)[val_idx]
+        for g in sorted(set(val_groups)):
+            mask = (val_groups == g)
+            if mask.sum() >= 2:
+                tf_scores.append(spearmanr(y_val[mask], y_pred[mask]))
+        median_tf = float(np.nanmedian(tf_scores)) if tf_scores else float('nan')
+        print(f"[FOLD {fold_idx+1}] Median per-TF Spearman={median_tf:.4f}")
 
     ms, rs, ss = zip(*all_metrics)
     print("\n[RESULT] Mean across folds:")
@@ -495,8 +785,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--subset", type=int, default=0, help="Optional limit on number of prediction dirs to load")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--folds", type=int, default=5, help="Number of grouped folds")
-    parser.add_argument("--model", type=str, choices=["linear", "mlp"], default="linear")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--model", type=str, choices=["linear", "mlp", "ridge"], default="linear")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--standardize", action="store_true", help="Standardize features per fold")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers for feature extraction (0=serial)")
@@ -506,6 +796,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--bce_weight", type=float, default=0.3, help="Weight for BCE loss when --predict_binary is set")
     parser.add_argument("--binary_threshold", type=float, default=None, help="Threshold on y to form binary labels; default=median per fold")
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden size for the MLP head")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability in MLP head")
+    parser.add_argument("--batch_size", type=int, default=512, help="Mini-batch size")
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay for AdamW")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping norm value")
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="Linear warmup steps before cosine decay")
+    parser.add_argument("--topk", type=int, default=256, help="Top-K edges for PD pooling")
+    parser.add_argument("--alpha", type=float, default=1.0, help="Alpha weight for contact term in edge score")
+    parser.add_argument("--beta", type=float, default=0.5, help="Beta weight for PAE term in edge score")
+    parser.add_argument("--gamma", type=float, default=0.2, help="Gamma weight for PDE term in edge score")
+    parser.add_argument("--tau", type=float, default=0.25, help="Tau contact threshold in edge score")
+    parser.add_argument("--audit_sample", action="store_true", help="Print 20 random (uniprot, nt, label) samples for manual audit")
     args = parser.parse_args(argv)
 
     try:
