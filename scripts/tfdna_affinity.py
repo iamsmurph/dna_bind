@@ -50,6 +50,8 @@ class CropMasks:
     mol_type_crop: np.ndarray       # [Lc]
     affinity_pair_mask: np.ndarray  # [Lc, Lc]
     pd_token_mask: np.ndarray       # [Lc]
+    pd_pairs: np.ndarray            # [K, 2] int64 indices (i,j) where protein->DNA
+    pd_flat_idx: np.ndarray         # [K] int64 flattened indices for [Lc*Lc]
 
 
 # =============================
@@ -411,6 +413,12 @@ def make_crop_masks(crop_to_full: np.ndarray,
     aff_mask = np.outer(is_prot, is_dna)
     aff_mask = aff_mask & np.outer(token_pad_mask_crop, token_pad_mask_crop)
 
+    # Precompute PD indices for sparse ops
+    ii, jj = np.where(aff_mask)
+    pd_pairs = np.stack([ii.astype(np.int64), jj.astype(np.int64)], axis=1) if ii.size else np.zeros((0, 2), dtype=np.int64)
+    Lc = rep_xyz_crop.shape[0]
+    pd_flat_idx = (pd_pairs[:, 0] * int(Lc) + pd_pairs[:, 1]).astype(np.int64) if pd_pairs.size else np.zeros((0,), dtype=np.int64)
+
     # Optional: if provided arrays are full-length, downselect here to crop for later sanity checks
     def _maybe_crop(mat: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if mat is None:
@@ -433,6 +441,8 @@ def make_crop_masks(crop_to_full: np.ndarray,
         mol_type_crop=mol_type_crop,
         affinity_pair_mask=aff_mask,
         pd_token_mask=pd_token_mask,
+        pd_pairs=pd_pairs,
+        pd_flat_idx=pd_flat_idx,
     )
 
 
@@ -463,6 +473,28 @@ def build_dist_bins(rep_xyz_crop: np.ndarray,
     return bins
 
 
+def build_dist_rbf(rep_xyz: np.ndarray | torch.Tensor,
+                   n_centers: int = 64,
+                   dmin: float = 2.0,
+                   dmax: float = 22.0,
+                   sigma: float = 1.0) -> torch.Tensor:
+    """RBF features over pairwise token distances.
+
+    Returns tensor of shape [L, L, n_centers].
+    """
+    if isinstance(rep_xyz, np.ndarray):
+        coords = torch.from_numpy(rep_xyz).float()
+    else:
+        coords = rep_xyz.to(dtype=torch.float32)
+    diff = coords[:, None, :] - coords[None, :, :]
+    D = torch.linalg.norm(diff, dim=-1)
+    centers = torch.linspace(float(dmin), float(dmax), steps=int(n_centers), device=D.device, dtype=D.dtype)
+    diff_cent = D[..., None] - centers[None, None, :]
+    phi = torch.exp(-0.5 * (diff_cent / max(1e-8, float(sigma))) ** 2)
+    phi = phi / (phi.sum(dim=-1, keepdim=True) + 1e-8)
+    return phi
+
+
 # =====================================
 # (d.2) Replica affinity head (PyTorch)
 # =====================================
@@ -470,7 +502,18 @@ def build_dist_bins(rep_xyz_crop: np.ndarray,
 
 class BoltzAffinityHeadReplica(nn.Module):
     def __init__(self, c_pair: int, c_single: int, b_bins: int,
-                 hidden: int = 256, use_soft_pool: bool = True, pool_temp: float = 4.0) -> None:
+                 hidden: int = 256,
+                 use_soft_pool: bool = True,
+                 pool_temp: float = 4.0,
+                 pooling: str = "attention",
+                 attn_hidden: int = 128,
+                 attn_dropout: float = 0.10,
+                 edge_dropout: float = 0.10,
+                 noise_std: float = 0.02,
+                 prior_w_contact: float = 1.0,
+                 prior_w_pae: float = 0.25,
+                 prior_w_pde: float = 0.10,
+                 prior_eps: float = 1e-6) -> None:
         super().__init__()
         self.c_pair = int(c_pair)
         self.c_single = int(c_single)
@@ -478,6 +521,12 @@ class BoltzAffinityHeadReplica(nn.Module):
         self.hidden = int(hidden)
         self.use_soft_pool = bool(use_soft_pool)
         self.pool_temp = float(pool_temp)
+        self.pooling = str(pooling)
+        self.noise_std = float(noise_std)
+        self.prior_w_contact = float(prior_w_contact)
+        self.prior_w_pae = float(prior_w_pae)
+        self.prior_w_pde = float(prior_w_pde)
+        self.prior_eps = float(prior_eps)
 
         # Single projections
         self.proj_u = nn.Linear(self.c_single, self.hidden)
@@ -493,19 +542,31 @@ class BoltzAffinityHeadReplica(nn.Module):
             nn.ReLU(),
             nn.Linear(self.hidden, 1),
         )
+        # Attention pooling block
+        self.attn_pool = AttnPool(in_dim=2 * self.c_pair,
+                                  hidden=int(attn_hidden),
+                                  attn_dropout=float(attn_dropout),
+                                  edge_dropout=float(edge_dropout))
 
     def forward(self,
                 z: torch.Tensor,
                 s_proxy: torch.Tensor,
                 dist_bins: torch.Tensor | np.ndarray,
                 masks: CropMasks,
-                edge_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                edge_weights: Optional[torch.Tensor] = None,
+                prior_contact: Optional[torch.Tensor] = None,
+                prior_pae: Optional[torch.Tensor] = None,
+                prior_pde: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         # Shapes and device alignment
         Lc = z.shape[0]
         if z.ndim != 3 or z.shape[0] != z.shape[1]:
             raise ValueError("z must be [Lc,Lc,C_pair]")
         if s_proxy.shape[0] != Lc:
             raise ValueError("s_proxy length must equal Lc")
+        # Optional feature noise (training only)
+        if self.training and self.noise_std > 0:
+            z = z + torch.randn_like(z) * self.noise_std
+            s_proxy = s_proxy + torch.randn_like(s_proxy) * (self.noise_std * 0.5)
         if isinstance(dist_bins, np.ndarray):
             dist_bins_t = torch.from_numpy(dist_bins)
         else:
@@ -519,53 +580,156 @@ class BoltzAffinityHeadReplica(nn.Module):
             raise AssertionError("b_bins must equal dist_bins last dim")
         s_proxy = s_proxy.to(device)
 
-        # Single -> pair bias
+        # Single projections (shared for dense/sparse)
         u = self.proj_u(s_proxy)  # [Lc,H]
         v = self.proj_v(s_proxy)  # [Lc,H]
-        # Expand to pair shape before concatenation
-        u_i = u[:, None, :].expand(-1, Lc, -1)  # [Lc,Lc,H]
-        v_j = v[None, :, :].expand(Lc, -1, -1)  # [Lc,Lc,H]
-        hadamard = u_i * v_j
-        gate = torch.cat([u_i, v_j, hadamard], dim=-1)
-        bias = self.to_bias(gate)  # [Lc,Lc,C_pair]
-        z_hat = z + bias
 
-        # Dist projection
-        d_proj = self.dist_proj(dist_bins_t)  # [Lc,Lc,C_pair]
-        h = torch.cat([z_hat, d_proj], dim=-1)
-        h = self.ln(h)
-        edge_scores_raw = self.mlp(h).squeeze(-1)  # [Lc,Lc]
+        outputs: Dict[str, torch.Tensor] = {}
 
-        # Mask PD edges
-        aff_mask_np = masks.affinity_pair_mask
-        if aff_mask_np.shape != (Lc, Lc):
-            raise ValueError("affinity_pair_mask shape mismatch")
-        aff_mask_t = torch.from_numpy(aff_mask_np).to(device)
-        if self.use_soft_pool:
-            neg_inf = torch.finfo(edge_scores_raw.dtype).min
-            edge_scores = torch.where(aff_mask_t, edge_scores_raw, torch.tensor(neg_inf, device=device))
+        use_sparse = (self.pooling == "attention") and hasattr(masks, "pd_pairs") and getattr(masks, "pd_pairs") is not None and len(getattr(masks, "pd_pairs")) > 0
+
+        if use_sparse:
+            # PD-only path: gather z and features on K edges
+            z = z.contiguous()
+            z_flat = z.view(-1, z.shape[-1])  # [Lc*Lc, C_pair]
+            pd_flat_idx_np = masks.pd_flat_idx  # numpy int64 [K]
+            pd_pairs_np = masks.pd_pairs       # numpy int64 [K,2]
+            pd_flat_idx = torch.from_numpy(pd_flat_idx_np).to(device=device, dtype=torch.long)
+            ij = torch.from_numpy(pd_pairs_np).to(device=device, dtype=torch.long)
+            i_idx, j_idx = ij[:, 0], ij[:, 1]
+
+            z_pd = z_flat.index_select(0, pd_flat_idx)  # [K, C_pair]
+
+            # PD-only bias from single-stream projections
+            u_i = u.index_select(0, i_idx)  # [K,H]
+            v_j = v.index_select(0, j_idx)  # [K,H]
+            hadamard = u_i * v_j
+            gate_pd = torch.cat([u_i, v_j, hadamard], dim=-1)  # [K, 3H]
+            bias_pd = self.to_bias(gate_pd)  # [K, C_pair]
+            z_hat_pd = z_pd + bias_pd
+
+            # Dist features on PD edges only
+            if dist_bins_t.dim() == 3 and dist_bins_t.shape[0] == Lc:
+                d_pd = dist_bins_t[i_idx, j_idx, :]  # [K, B]
+            else:
+                # assume already [K,B]
+                d_pd = dist_bins_t
+            if d_pd.shape[-1] != self.b_bins:
+                raise AssertionError("b_bins must equal dist_bins last dim")
+            d_proj_pd = self.dist_proj(d_pd.to(device=device, dtype=z_hat_pd.dtype))  # [K,C_pair]
+            h_pd = torch.cat([z_hat_pd, d_proj_pd], dim=-1)  # [K, 2*C_pair]
+            h_pd = self.ln(h_pd)
+
+            # PD-only priors
+            pri_pd: Optional[torch.Tensor] = None
+            if (prior_contact is not None) or (prior_pae is not None) or (prior_pde is not None):
+                c_pd = prior_contact[i_idx, j_idx] if isinstance(prior_contact, torch.Tensor) and prior_contact.dim() >= 2 else (prior_contact if isinstance(prior_contact, torch.Tensor) else None)
+                pae_pd = prior_pae[i_idx, j_idx] if isinstance(prior_pae, torch.Tensor) and prior_pae.dim() >= 2 else (prior_pae if isinstance(prior_pae, torch.Tensor) else None)
+                pde_pd = prior_pde[i_idx, j_idx] if isinstance(prior_pde, torch.Tensor) and prior_pde.dim() >= 2 else (prior_pde if isinstance(prior_pde, torch.Tensor) else None)
+                pri_pd = make_prior_logits(
+                    contact=c_pd,
+                    pae=pae_pd,
+                    pde=pde_pd,
+                    w_contact=self.prior_w_contact,
+                    w_pae=self.prior_w_pae,
+                    w_pde=self.prior_w_pde,
+                    eps=self.prior_eps,
+                )
+
+            pooled, w_pd = self.attn_pool.forward_sparse(
+                edge_feats=h_pd,
+                priors_logits=pri_pd,
+                temp=self.pool_temp,
+                training=self.training,
+            )
+            outputs["attn_weights_pd"] = w_pd
+            outputs["pooled_value"] = pooled
+            aff_scalar = pooled
+        elif self.pooling == "attention":
+            # Dense attention path (fallback)
+            # Build pair-bias densely
+            u_i = u[:, None, :].expand(-1, Lc, -1)  # [Lc,Lc,H]
+            v_j = v[None, :, :].expand(Lc, -1, -1)  # [Lc,Lc,H]
+            hadamard = u_i * v_j
+            gate = torch.cat([u_i, v_j, hadamard], dim=-1)
+            bias = self.to_bias(gate)  # [Lc,Lc,C_pair]
+            z_hat = z + bias
+
+            # Dist projection
+            d_proj = self.dist_proj(dist_bins_t)  # [Lc,Lc,C_pair]
+            h = torch.cat([z_hat, d_proj], dim=-1)
+            h = self.ln(h)
+
+            # Mask PD edges
+            aff_mask_np = masks.affinity_pair_mask
+            if aff_mask_np.shape != (Lc, Lc):
+                raise ValueError("affinity_pair_mask shape mismatch")
+            aff_mask_t = torch.from_numpy(aff_mask_np).to(device)
+
+            # Build priors logits from available signals
+            priors_logits: Optional[torch.Tensor] = None
+            if (prior_contact is not None) or (prior_pae is not None) or (prior_pde is not None):
+                c_t = prior_contact.to(device) if isinstance(prior_contact, torch.Tensor) else None
+                pae_t = prior_pae.to(device) if isinstance(prior_pae, torch.Tensor) else None
+                pde_t = prior_pde.to(device) if isinstance(prior_pde, torch.Tensor) else None
+                priors_logits = make_prior_logits(
+                    contact=c_t,
+                    pae=pae_t,
+                    pde=pde_t,
+                    w_contact=self.prior_w_contact,
+                    w_pae=self.prior_w_pae,
+                    w_pde=self.prior_w_pde,
+                    eps=self.prior_eps,
+                )
+
+            pooled, attn_w = self.attn_pool(
+                edge_feats=h,
+                pd_mask=aff_mask_t,
+                priors_logits=priors_logits,
+                temp=self.pool_temp,
+                training=self.training,
+            )
+            outputs["attn_weights"] = attn_w
+            aff_scalar = pooled
         else:
-            edge_scores = torch.where(aff_mask_t, edge_scores_raw, torch.zeros_like(edge_scores_raw))
+            # Legacy LSE or mean pooling
+            # Build pair-bias densely for LSE path
+            u_i = u[:, None, :].expand(-1, Lc, -1)  # [Lc,Lc,H]
+            v_j = v[None, :, :].expand(Lc, -1, -1)  # [Lc,Lc,H]
+            hadamard = u_i * v_j
+            gate = torch.cat([u_i, v_j, hadamard], dim=-1)
+            bias = self.to_bias(gate)  # [Lc,Lc,C_pair]
+            z_hat = z + bias
 
-        # Optional edge weights as additive bias
-        if edge_weights is not None:
-            if edge_weights.shape != edge_scores_raw.shape:
-                raise ValueError("edge_weights must be [Lc,Lc]")
-            edge_weights = edge_weights.to(device)
-            edge_scores = edge_scores + edge_weights
+            d_proj = self.dist_proj(dist_bins_t)
+            h = torch.cat([z_hat, d_proj], dim=-1)
+            h = self.ln(h)
+            edge_scores_raw = self.mlp(h).squeeze(-1)  # [Lc,Lc]
 
-        # Pooling over PD edges
-        if self.use_soft_pool:
-            temp = max(1e-6, self.pool_temp)
-            valid_mask = aff_mask_t
-            vals = edge_scores[valid_mask]
-            aff_scalar = (temp * torch.logsumexp(vals / temp, dim=0)) if vals.numel() else edge_scores.new_tensor(0.0)
-        else:
-            # mean over PD edges only
-            denom = aff_mask_t.sum().clamp(min=1)
-            aff_scalar = (edge_scores * aff_mask_t).sum() / denom
+            aff_mask_np = masks.affinity_pair_mask
+            if aff_mask_np.shape != (Lc, Lc):
+                raise ValueError("affinity_pair_mask shape mismatch")
+            aff_mask_t = torch.from_numpy(aff_mask_np).to(device)
 
-        return {"affinity": aff_scalar, "edge_scores": edge_scores}
+            edge_scores = edge_scores_raw
+            if edge_weights is not None:
+                if edge_weights.shape != edge_scores_raw.shape:
+                    raise ValueError("edge_weights must be [Lc,Lc]")
+                edge_weights = edge_weights.to(device)
+                edge_scores = edge_scores + edge_weights
+
+            if self.use_soft_pool:
+                neg_inf = torch.finfo(edge_scores.dtype).min
+                masked = torch.where(aff_mask_t, edge_scores, torch.tensor(neg_inf, device=device))
+                temp = max(1e-6, self.pool_temp)
+                vals = masked[aff_mask_t]
+                aff_scalar = (temp * torch.logsumexp(vals / temp, dim=0)) if vals.numel() else edge_scores.new_tensor(0.0)
+            else:
+                denom = aff_mask_t.sum().clamp(min=1)
+                aff_scalar = (edge_scores * aff_mask_t).sum() / denom
+            outputs["edge_scores"] = edge_scores
+
+        return {"affinity": aff_scalar, **outputs}
 
 
 # =====================
@@ -574,9 +738,35 @@ class BoltzAffinityHeadReplica(nn.Module):
 
 
 class TFAffinityRegressor(nn.Module):
-    def __init__(self, c_pair: int, c_single: int, n_bins: int, use_soft_pool: bool = True) -> None:
+    def __init__(self, c_pair: int, c_single: int, n_bins: int,
+                 use_soft_pool: bool = True,
+                 pooling: str = "attention",
+                 attn_hidden: int = 128,
+                 attn_dropout: float = 0.10,
+                 edge_dropout: float = 0.10,
+                 pool_temp: float = 4.0,
+                 noise_std: float = 0.02,
+                 prior_w_contact: float = 1.0,
+                 prior_w_pae: float = 0.25,
+                 prior_w_pde: float = 0.10,
+                 prior_eps: float = 1e-6) -> None:
         super().__init__()
-        self.head = BoltzAffinityHeadReplica(c_pair=c_pair, c_single=c_single, b_bins=n_bins, use_soft_pool=use_soft_pool)
+        self.head = BoltzAffinityHeadReplica(
+            c_pair=c_pair,
+            c_single=c_single,
+            b_bins=n_bins,
+            use_soft_pool=use_soft_pool,
+            pool_temp=pool_temp,
+            pooling=pooling,
+            attn_hidden=attn_hidden,
+            attn_dropout=attn_dropout,
+            edge_dropout=edge_dropout,
+            noise_std=noise_std,
+            prior_w_contact=prior_w_contact,
+            prior_w_pae=prior_w_pae,
+            prior_w_pde=prior_w_pde,
+            prior_eps=prior_eps,
+        )
         self.calib = nn.Linear(1, 1)
         # Start near identity so early losses are sane
         with torch.no_grad():
@@ -588,11 +778,102 @@ class TFAffinityRegressor(nn.Module):
                 s_proxy: torch.Tensor,
                 dist_bins: torch.Tensor | np.ndarray,
                 masks: CropMasks,
-                edge_weights: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        out = self.head(z, s_proxy, dist_bins, masks, edge_weights=edge_weights)
+                edge_weights: Optional[torch.Tensor] = None,
+                prior_contact: Optional[torch.Tensor] = None,
+                prior_pae: Optional[torch.Tensor] = None,
+                prior_pde: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        out = self.head(
+            z, s_proxy, dist_bins, masks,
+            edge_weights=edge_weights,
+            prior_contact=prior_contact,
+            prior_pae=prior_pae,
+            prior_pde=prior_pde,
+        )
         aff = out["affinity"].reshape(1, 1)
         y_hat = self.calib(aff).reshape(-1)  # (1,)
         return y_hat, out
+
+
+class AttnPool(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 128, attn_dropout: float = 0.1, edge_dropout: float = 0.1) -> None:
+        super().__init__()
+        self.value_mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(attn_dropout),
+            nn.Linear(hidden, 1)
+        )
+        self.logit_mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(attn_dropout),
+            nn.Linear(hidden, 1)
+        )
+        self.edge_dropout = float(edge_dropout)
+
+    def forward(self,
+                edge_feats: torch.Tensor,
+                pd_mask: torch.Tensor,
+                priors_logits: Optional[torch.Tensor] = None,
+                temp: float = 4.0,
+                training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        v = self.value_mlp(edge_feats).squeeze(-1)
+        logit = self.logit_mlp(edge_feats).squeeze(-1)
+        if priors_logits is not None:
+            logit = logit + priors_logits.to(device=logit.device, dtype=logit.dtype)
+        neg_inf = torch.finfo(logit.dtype).min
+        logit = torch.where(pd_mask, logit, torch.tensor(neg_inf, device=logit.device, dtype=logit.dtype))
+        if training and self.edge_dropout > 0:
+            keep = (torch.rand_like(logit) > self.edge_dropout) | (~pd_mask)
+            logit = torch.where(keep, logit, torch.tensor(neg_inf, device=logit.device, dtype=logit.dtype))
+        flat = (logit / max(1e-6, float(temp))).reshape(-1)
+        w = torch.softmax(flat, dim=-1).reshape_as(logit)
+        pooled = (w * v).sum()
+        return pooled, w
+
+    def forward_sparse(self,
+                       edge_feats: torch.Tensor,
+                       priors_logits: Optional[torch.Tensor] = None,
+                       temp: float = 4.0,
+                       training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        # edge_feats: [K, D]
+        v = self.value_mlp(edge_feats).squeeze(-1)  # [K]
+        logit = self.logit_mlp(edge_feats).squeeze(-1)  # [K]
+        if priors_logits is not None:
+            logit = logit + priors_logits.to(device=logit.device, dtype=logit.dtype)
+        if training and self.edge_dropout > 0:
+            keep = (torch.rand_like(logit) > self.edge_dropout)
+            neg_inf = torch.finfo(logit.dtype).min
+            logit = torch.where(keep, logit, torch.tensor(neg_inf, device=logit.device, dtype=logit.dtype))
+        w = torch.softmax(logit / max(1e-6, float(temp)), dim=0)  # [K]
+        pooled = (w * v).sum()
+        return pooled, w
+
+
+def make_prior_logits(contact: Optional[torch.Tensor] = None,
+                      pae: Optional[torch.Tensor] = None,
+                      pde: Optional[torch.Tensor] = None,
+                      w_contact: float = 1.0,
+                      w_pae: float = 0.25,
+                      w_pde: float = 0.10,
+                      eps: float = 1e-6,
+                      pae_scale: float = 10.0,
+                      pde_scale: float = 10.0) -> torch.Tensor:
+    pri = None
+    if contact is not None:
+        c = contact.to(dtype=torch.float32)
+        term = float(w_contact) * torch.log(c.clamp_min(float(eps)))
+        pri = term if pri is None else pri + term
+    if pae is not None:
+        paet = pae.to(dtype=torch.float32)
+        term = float(w_pae) * (-(paet / float(pae_scale)))
+        pri = term if pri is None else pri + term
+    if pde is not None:
+        pdet = pde.to(dtype=torch.float32)
+        term = float(w_pde) * (-(pdet / float(pde_scale)))
+        pri = term if pri is None else pri + term
+    if pri is None:
+        # default zero log-prior
+        pri = torch.tensor(0.0)
+    return pri
 
 
 def indexing_roundtrip_ok(crop_to_full: np.ndarray, Lf: int) -> bool:
@@ -705,8 +986,11 @@ __all__ = [
     "parse_cif_to_token_geom",
     "make_crop_masks",
     "build_dist_bins",
+    "build_dist_rbf",
     "BoltzAffinityHeadReplica",
     "TFAffinityRegressor",
+    "AttnPool",
+    "make_prior_logits",
     "predict_intensity",
     "indexing_roundtrip_ok",
     "geometry_sanity",
