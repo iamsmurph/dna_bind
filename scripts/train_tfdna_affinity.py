@@ -17,6 +17,7 @@ from collections import defaultdict
 import hashlib
 import json
 import collections
+from types import SimpleNamespace
 
 import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -163,20 +164,7 @@ class AffinityDataset:
         d = self.pred_dirs[i]
         # Keep tensors on CPU; Lightning will handle device placement in the module
         bundle = load_crop_bundle(d, device=torch.device("cpu"))
-        cif = bundle.meta.get("cif_path")
-        if not cif or not os.path.exists(cif):
-            raise FileNotFoundError(f"Missing CIF for {d}")
-        geom = parse_cif_to_token_geom(cif)
 
-        masks = make_crop_masks(bundle.crop_to_full, geom, bundle.contact_probs, bundle.pae, bundle.pde)
-        # masks should have at least one PD edge; datasets are prefiltered in setup
-        if not np.any(masks.affinity_pair_mask):
-            # Return a dummy but consistent sample to avoid DataLoader errors (shouldn't occur)
-            # Use zero weights and zero label
-            y_dummy = torch.tensor(0.0, dtype=torch.float32)
-            return Sample(z=bundle.z, s_proxy=bundle.s_proxy, dist_bins=build_dist_bins(masks.rep_xyz_crop),
-                          masks=masks, y=y_dummy, edge_weights=None,
-                          uniprot=bundle.meta.get("uniprot", ""), sequence=bundle.meta.get("sequence", ""))
         # Optional disk+mem cache for PD-only features
         use_cache = bool(self.cache_dir)
         os.makedirs(self.cache_dir, exist_ok=True) if use_cache else None
@@ -187,17 +175,66 @@ class AffinityDataset:
 
         cache_path = os.path.join(self.cache_dir, f"{key}.npz") if use_cache else ""
         have_cache = use_cache and os.path.exists(cache_path)
+
+        # Try fast path: skip CIF parsing when cache hit with RBF PD features available
+        fast_cached = False
+        masks = None
+        contact_pd_np = None
+        pae_pd_np = None
+        pde_pd_np = None
+        dist_pd_np = None
+        if have_cache:
+            data = np.load(cache_path)
+            L_arr = data.get("L")
+            pd_pairs_np = data.get("pd_pairs")
+            pd_flat_idx_np = data.get("pd_flat_idx")
+            if self.dist_feats == "rbf":
+                dist_pd_np = data.get("dist_rbf_pd")
+            contact_pd_np = data.get("contact_pd")
+            pae_pd_np = data.get("pae_pd")
+            pde_pd_np = data.get("pde_pd")
+            if (self.dist_feats == "rbf") and isinstance(dist_pd_np, np.ndarray) and isinstance(pd_pairs_np, np.ndarray) and isinstance(L_arr, np.ndarray):
+                Lc = int(L_arr.reshape(-1)[0])
+                aff_mask = np.zeros((Lc, Lc), dtype=bool)
+                if pd_pairs_np.size:
+                    ii = pd_pairs_np[:, 0].astype(np.int64)
+                    jj = pd_pairs_np[:, 1].astype(np.int64)
+                    aff_mask[ii, jj] = True
+                masks = SimpleNamespace(
+                    rep_xyz_crop=np.zeros((Lc, 3), dtype=np.float32),
+                    token_pad_mask_crop=np.ones((Lc,), dtype=bool),
+                    mol_type_crop=np.zeros((Lc,), dtype=np.int8),
+                    affinity_pair_mask=aff_mask,
+                    pd_token_mask=np.ones((Lc,), dtype=bool),
+                    pd_pairs=pd_pairs_np.astype(np.int64),
+                    pd_flat_idx=(pd_flat_idx_np.astype(np.int64) if isinstance(pd_flat_idx_np, np.ndarray) and pd_flat_idx_np.size else (pd_pairs_np[:,0].astype(np.int64) * int(Lc) + pd_pairs_np[:,1].astype(np.int64))),
+                )
+                fast_cached = True
+
+        if not fast_cached:
+            cif = bundle.meta.get("cif_path")
+            if not cif or not os.path.exists(cif):
+                raise FileNotFoundError(f"Missing CIF for {d}")
+            geom = parse_cif_to_token_geom(cif)
+            masks = make_crop_masks(bundle.crop_to_full, geom, bundle.contact_probs, bundle.pae, bundle.pde)
+            # masks should have at least one PD edge; datasets are prefiltered in setup
+            if not np.any(masks.affinity_pair_mask):
+                # Return a dummy but consistent sample to avoid DataLoader errors (shouldn't occur)
+                # Use zero weights and zero label
+                y_dummy = torch.tensor(0.0, dtype=torch.float32)
+                return Sample(z=bundle.z, s_proxy=bundle.s_proxy, dist_bins=build_dist_bins(masks.rep_xyz_crop),
+                              masks=masks, y=y_dummy, edge_weights=None,
+                              uniprot=bundle.meta.get("uniprot", ""), sequence=bundle.meta.get("sequence", ""))
+
+        # Build PD indices for feature construction (dense path computed below if needed)
         pd_pairs = masks.pd_pairs  # [K,2]
         i_idx = pd_pairs[:, 0]
         j_idx = pd_pairs[:, 1]
 
-        if have_cache:
-            data = np.load(cache_path)
-            dist_pd_np = data.get("dist_rbf_pd") if (self.dist_feats == "rbf") else None
-            contact_pd_np = data.get("contact_pd")
-            pae_pd_np = data.get("pae_pd")
-            pde_pd_np = data.get("pde_pd")
-        else:
+        # If no cache or fast path not available, optionally compute and save cache
+        if not fast_cached:
+            if have_cache:
+                data = None  # avoid confusion
             # Build PD-only priors
             contact_c = downselect_pairwise(bundle.contact_probs, bundle.crop_to_full)
             pae_c = downselect_pairwise(bundle.pae, bundle.crop_to_full)
@@ -225,7 +262,7 @@ class AffinityDataset:
                     "pd_flat_idx": masks.pd_flat_idx.astype(np.int64),
                     "contact_pd": contact_pd_np if contact_pd_np is not None else np.array([], dtype=np.float16),
                     "pae_pd": pae_pd_np if pae_pd_np is not None else np.array([], dtype=np.float16),
-                    "pde_pd": pde_pd_np if pde_pd_np is not None else np.array([], dtype=np.float16),
+                    "pde_pd": pde_pd_np if pae_pd_np is not None else np.array([], dtype=np.float16),
                 }
                 if dist_pd_np is not None:
                     arrs["dist_rbf_pd"] = dist_pd_np
@@ -233,9 +270,9 @@ class AffinityDataset:
                 os.replace(tmp, cache_path)
 
         # Build tensors, pinned where helpful
-        if self.dist_feats == "rbf" and (use_cache and have_cache):
+        if self.dist_feats == "rbf" and isinstance(dist_pd_np, np.ndarray):
             dist_bins_t = self._to_pinned_half(dist_pd_np)
-        elif self.dist_feats == "rbf" and not use_cache:
+        elif self.dist_feats == "rbf" and not isinstance(dist_pd_np, np.ndarray):
             # compute on the fly to torch
             coords = torch.from_numpy(masks.rep_xyz_crop.astype(np.float32))
             i_t = torch.from_numpy(i_idx.astype(np.int64))
@@ -562,9 +599,9 @@ class AffinityLightningModule(pl.LightningModule):
             dist_bins = torch.from_numpy(dist_bins)
         dist_bins = dist_bins.to(device=device, dtype=z.dtype, non_blocking=True)
         edge_w = sample.edge_weights.to(device, non_blocking=True) if sample.edge_weights is not None else None
-        prior_c = sample.prior_contact.to(device) if isinstance(sample.prior_contact, torch.Tensor) else None
-        prior_pae = sample.prior_pae.to(device) if isinstance(sample.prior_pae, torch.Tensor) else None
-        prior_pde = sample.prior_pde.to(device) if isinstance(sample.prior_pde, torch.Tensor) else None
+        prior_c = sample.prior_contact.to(device, non_blocking=True) if isinstance(sample.prior_contact, torch.Tensor) else None
+        prior_pae = sample.prior_pae.to(device, non_blocking=True) if isinstance(sample.prior_pae, torch.Tensor) else None
+        prior_pde = sample.prior_pde.to(device, non_blocking=True) if isinstance(sample.prior_pde, torch.Tensor) else None
         y_hat, out = self.model(z, s, dist_bins, sample.masks, edge_weights=edge_w,
                                 prior_contact=prior_c, prior_pae=prior_pae, prior_pde=prior_pde)
         return y_hat, out
