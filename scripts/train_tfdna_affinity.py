@@ -232,7 +232,6 @@ class AffinityLightningModule(pl.LightningModule):
         opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay, fused=use_fused)
         return opt
 
-
 def infer_dims_from_datamodule(dm: AffinityDataModule) -> Tuple[int, int, int]:
     # Ensure setup has run
     if dm.train_ds is None:
@@ -243,7 +242,6 @@ def infer_dims_from_datamodule(dm: AffinityDataModule) -> Tuple[int, int, int]:
     c_single = int(probe.s_proxy.shape[-1])
     n_bins = int(probe.dist_bins.shape[-1])
     return c_pair, c_single, n_bins
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
