@@ -407,7 +407,8 @@ def make_crop_masks(crop_to_full: np.ndarray,
     is_prot = (mol_type_crop == 0)
     is_dna = (mol_type_crop == 1)
     pd_token_mask = (is_prot | is_dna)
-    aff_mask = (np.outer(is_prot, is_dna) | np.outer(is_dna, is_prot))
+    # One-sided protein→DNA mask to avoid double-counting pairs
+    aff_mask = np.outer(is_prot, is_dna)
     aff_mask = aff_mask & np.outer(token_pad_mask_crop, token_pad_mask_crop)
 
     # Optional: if provided arrays are full-length, downselect here to crop for later sanity checks
@@ -521,8 +522,9 @@ class BoltzAffinityHeadReplica(nn.Module):
         # Single -> pair bias
         u = self.proj_u(s_proxy)  # [Lc,H]
         v = self.proj_v(s_proxy)  # [Lc,H]
-        u_i = u[:, None, :]
-        v_j = v[None, :, :]
+        # Expand to pair shape before concatenation
+        u_i = u[:, None, :].expand(-1, Lc, -1)  # [Lc,Lc,H]
+        v_j = v[None, :, :].expand(Lc, -1, -1)  # [Lc,Lc,H]
         hadamard = u_i * v_j
         gate = torch.cat([u_i, v_j, hadamard], dim=-1)
         bias = self.to_bias(gate)  # [Lc,Lc,C_pair]
@@ -547,16 +549,17 @@ class BoltzAffinityHeadReplica(nn.Module):
 
         # Optional edge weights as additive bias
         if edge_weights is not None:
+            if edge_weights.shape != edge_scores_raw.shape:
+                raise ValueError("edge_weights must be [Lc,Lc]")
             edge_weights = edge_weights.to(device)
             edge_scores = edge_scores + edge_weights
 
         # Pooling over PD edges
         if self.use_soft_pool:
             temp = max(1e-6, self.pool_temp)
-            neg_inf = torch.finfo(edge_scores_raw.dtype).min
-            flat = edge_scores.reshape(-1)
-            valid = flat[flat > (neg_inf / 2)]
-            aff_scalar = (temp * torch.logsumexp(valid / temp, dim=0)) if valid.numel() else edge_scores.new_tensor(0.0)
+            valid_mask = aff_mask_t
+            vals = edge_scores[valid_mask]
+            aff_scalar = (temp * torch.logsumexp(vals / temp, dim=0)) if vals.numel() else edge_scores.new_tensor(0.0)
         else:
             # mean over PD edges only
             denom = aff_mask_t.sum().clamp(min=1)
@@ -568,6 +571,28 @@ class BoltzAffinityHeadReplica(nn.Module):
 # =====================
 # Sanity check utilities
 # =====================
+
+
+class TFAffinityRegressor(nn.Module):
+    def __init__(self, c_pair: int, c_single: int, n_bins: int, use_soft_pool: bool = True) -> None:
+        super().__init__()
+        self.head = BoltzAffinityHeadReplica(c_pair=c_pair, c_single=c_single, b_bins=n_bins, use_soft_pool=use_soft_pool)
+        self.calib = nn.Linear(1, 1)
+        # Start near identity so early losses are sane
+        with torch.no_grad():
+            self.calib.weight.fill_(1.0)
+            self.calib.bias.zero_()
+
+    def forward(self,
+                z: torch.Tensor,
+                s_proxy: torch.Tensor,
+                dist_bins: torch.Tensor | np.ndarray,
+                masks: CropMasks,
+                edge_weights: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        out = self.head(z, s_proxy, dist_bins, masks, edge_weights=edge_weights)
+        aff = out["affinity"].reshape(1, 1)
+        y_hat = self.calib(aff).reshape(-1)  # (1,)
+        return y_hat, out
 
 
 def indexing_roundtrip_ok(crop_to_full: np.ndarray, Lf: int) -> bool:
@@ -648,6 +673,30 @@ def compute_edge_weights(contact: Optional[np.ndarray],
     return w
 
 
+@torch.no_grad()
+def predict_intensity(model: nn.Module, sample) -> Tuple[float, Dict[str, torch.Tensor]]:
+    """Predict intensity_log1p for a single sample using a trained regressor.
+
+    Expects `sample` to provide attributes: z, s or s_proxy, dist_bins, masks.
+    Moves tensors to the model's device before running inference.
+    """
+    device = next((p.device for p in model.parameters()), torch.device("cpu"))
+    z = getattr(sample, "z")
+    s = getattr(sample, "s", None)
+    if s is None:
+        s = getattr(sample, "s_proxy")
+    dist_bins = getattr(sample, "dist_bins")
+    masks = getattr(sample, "masks")
+    edge_w = getattr(sample, "edge_weights", None)
+
+    z = z.to(device)
+    s = s.to(device)
+    # head will move dist_bins to z.device; leave as-is if numpy/tensor
+
+    y_hat, out = model(z, s, dist_bins, masks, edge_weights=edge_w)
+    return float(y_hat.detach().cpu().reshape(()).item()), out
+
+
 __all__ = [
     "CropBundle",
     "TokenGeom",
@@ -657,9 +706,12 @@ __all__ = [
     "make_crop_masks",
     "build_dist_bins",
     "BoltzAffinityHeadReplica",
+    "TFAffinityRegressor",
+    "predict_intensity",
     "indexing_roundtrip_ok",
     "geometry_sanity",
     "pd_correlation",
+    "compute_edge_weights",
 ]
 
 
