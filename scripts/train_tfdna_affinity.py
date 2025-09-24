@@ -76,6 +76,8 @@ class Sample:
     def pin_memory(self):
         self.z = self.z.pin_memory()
         self.s_proxy = self.s_proxy.pin_memory()
+        if isinstance(self.dist_bins, torch.Tensor):
+            self.dist_bins = self.dist_bins.pin_memory()
         if isinstance(self.edge_weights, torch.Tensor):
             self.edge_weights = self.edge_weights.pin_memory()
         if isinstance(self.prior_contact, torch.Tensor):
@@ -246,7 +248,7 @@ class AffinityDataset:
         else:
             # fallback to dense bins if requested; keep original behavior
             dist_bins_np = build_dist_bins(masks.rep_xyz_crop)
-            dist_bins_t = torch.from_numpy(dist_bins_np)
+            dist_bins_t = torch.from_numpy(dist_bins_np).to(torch.float16).pin_memory()
 
         # Priors as pinned half vectors when available
         c_t = self._to_pinned_half(contact_pd_np) if isinstance(contact_pd_np, np.ndarray) and contact_pd_np.size else None
