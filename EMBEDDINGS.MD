@@ -1,14 +1,22 @@
-# Embedding extraction scripts / chunks
+# Boltz 2 scripts location
+
+/data/rbg/users/seanmurphy/boltz
+
+# Command used to save embeddings
+boltz predict --devices 8 --cache /storage/ujp/.cache/huggingface --diffusion_samples 1 --write_full_pde --write_full_pae --write_contact_probs --write_tm_expected_value --write_cropped_embeddings ../../boltz_runs/uniprobe_subset_100tfs/chunk_0;
+
+# Location of embeddings, scripts, and other relevant files
 /data/rbg/users/ujp/dnabind/boltz_runs/uniprobe_subset_100tfs/
 
 ## Scripts for extracting Boltz 2 embeddings by chunks
 run_script_0.sh  run_script_1.sh run_script_2.sh  run_script_3.sh
 
-# ARGUMENT and OUTPUT
-boltz predict --devices 8 --cache /storage/ujp/.cache/huggingface --diffusion_samples 1 --write_full_pde --write_full_pae --write_contact_probs --write_tm_expected_value --write_cropped_embeddings ../../boltz_runs/uniprobe_subset_100tfs/chunk_0;
+## Chunk Inputs
+chunk_0 chunk_1 chunk_2 chunk_4
 
-## Chunk Folders
+## Chunk Results Folders 
 boltz_results_chunk_0  boltz_results_chunk_1  boltz_results_chunk_2  boltz_results_chunk_3
+
 ## Example .pt file
 ls /data/rbg/users/ujp/dnabind/boltz_runs/uniprobe_subset_100tfs/boltz_results_chunk_0/predictions/P38128_9.964522083305246_AATTTATATTTCCCCGCATATCCGGCTCACTCCCGGGTCTGTGTTCCGTTGTCCGTGCTG/
 
@@ -20,7 +28,6 @@ pae_P38128_9.964522083305246_AATTTATATTTCCCCGCATATCCGGCTCACTCCCGGGTCTGTGTTCCGTTG
 pde_P38128_9.964522083305246_AATTTATATTTCCCCGCATATCCGGCTCACTCCCGGGTCTGTGTTCCGTTGTCCGTGCTG_model_0.npz
 plddt_P38128_9.964522083305246_AATTTATATTTCCCCGCATATCCGGCTCACTCCCGGGTCTGTGTTCCGTTGTCCGTGCTG_model_0.npz
 tm_expected_value_P38128_9.964522083305246_AATTTATATTTCCCCGCATATCCGGCTCACTCCCGGGTCTGTGTTCCGTTGTCCGTGCTG_model_0.npz
-
 
 ## s_full vs s_inputs (and what's stored in cropped .pt)
 
