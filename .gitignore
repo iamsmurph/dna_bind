@@ -16,3 +16,5 @@ msa+checkpoints/
 
 # ignore debug temp artifacts
 boltz/scripts/debug/*.pt
+
+runs_cache/
