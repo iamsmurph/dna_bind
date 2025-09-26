@@ -83,41 +83,76 @@ def parse_cif_to_token_geom(cif_path: str, expected_Lf: Optional[int] = None) ->
                 raise ValueError("Unreasonable inter-token distance > 200 Å")
         return TokenGeom(rep_xyz=rep, mol_type=mol_type, token_pad_mask=pad, token_meta=meta)
 
-    # gemmi path
-    st = gemmi.make_structure_from_block(gemmi.cif.read(cif_path).sole_block())
+    # gemmi path: iterate subchains (polymer spans) and infer polymer type correctly
+    st = gemmi.read_structure(cif_path)
     st.setup_entities()
     model = st[0]
     PROT, DNA, OTHER = 0, 1, 2
+    # Build robust polymer-type sets that tolerate older/newer gemmi builds
+    PEPTIDE_TYPES = {
+        t for t in (
+            getattr(gemmi.PolymerType, "PeptideL", None),
+            getattr(gemmi.PolymerType, "PeptideD", None),
+            getattr(gemmi.PolymerType, "PeptideLike", None),
+            getattr(gemmi.PolymerType, "Peptide", None),
+        ) if t is not None
+    }
+    NUCLEIC_TYPES = {
+        t for t in (
+            getattr(gemmi.PolymerType, "Dna", None),
+            getattr(gemmi.PolymerType, "Rna", None),
+            getattr(gemmi.PolymerType, "DnaRnaHybrid", None),
+            getattr(gemmi.PolymerType, "NucleicAcid", None),
+        ) if t is not None
+    }
+
+    def _find_atom(res, name: str):
+        # Try Gemmi's no-altloc sentinel first, then common alternates
+        for alt in ('\x00', 'A', '1', 'B'):
+            a = res.find_atom(name, alt)
+            if a is not None:
+                return a
+        # Final fallback: scan all atoms by name (ignores altloc)
+        for a in res:
+            if a.name == name:
+                return a
+        return None
     rep: List[tuple] = []
     typ: List[int] = []
     pad: List[bool] = []
     meta: List[dict] = []
-    for chain in model:
-        pt = chain.get_polymer_type()
-        if pt in {gemmi.PolymerType.PeptideL, gemmi.PolymerType.PeptideLike}:
+    for span in model.subchains():
+        chain_label = span.subchain_id()
+        ent = st.get_entity_of(span) if st.entities else None
+        try:
+            ptype = ent.polymer_type if ent is not None else span.check_polymer_type()
+        except Exception:
+            ptype = span.check_polymer_type()
+        if ptype in PEPTIDE_TYPES:
             mtype = PROT
-        elif pt == gemmi.PolymerType.DNA:
+            prefer, fallback = ("CA",), ("CB", "CA")
+        elif ptype in NUCLEIC_TYPES:
             mtype = DNA
+            prefer, fallback = ("C4'", "C4*"), ("P", "C3'", "C3*")
         else:
             mtype = OTHER
-        for res in chain.get_polymer():
-            prefer = ["C4'", "C4*"] if mtype == DNA else ["CA"]
-            fallback = ["P", "C3'", "C3*"] if mtype == DNA else ["CB", "CA"]
+            prefer, fallback = (), ()
+        for res in span.first_conformer():
             xyz = None
-            for nm in prefer + fallback:
-                a = next((a for a in res if a.name == nm), None)
+            for name in (*prefer, *fallback):
+                a = _find_atom(res, name)
                 if a is not None:
                     xyz = (a.pos.x, a.pos.y, a.pos.z)
                     break
             if xyz is None:
-                coords = [(a.pos.x, a.pos.y, a.pos.z) for a in res if a.element.name != "H"]
+                coords = [(a.pos.x, a.pos.y, a.pos.z) for a in res if a.element != gemmi.Element('H')]
                 if coords:
-                    xyz = tuple(np.mean(np.asarray(coords, np.float64), axis=0))
+                    xyz = tuple(np.mean(np.asarray(coords, dtype=np.float64), axis=0))
             if xyz is not None:
                 rep.append(xyz)
                 typ.append(mtype)
                 pad.append(True)
-                meta.append({"chain": chain.name, "resname": res.name, "resseq": res.seqid.num})
+                meta.append({"subchain": chain_label, "chain": chain_label, "resname": res.name, "auth_seq_id": res.seqid.num})
 
     rep_arr = np.asarray(rep, dtype=np.float32)
     mol_type_arr = np.asarray(typ, dtype=np.int8)

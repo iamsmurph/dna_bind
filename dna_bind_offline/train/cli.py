@@ -13,6 +13,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 
 from ..data.datamodule import AffinityDataModule
+from ..utils.hashing_cache import read_json
 from .lightning_module import AffinityLightningModule
 
 
@@ -70,6 +71,11 @@ def main() -> None:
     ap.add_argument("--cache-format", type=str, choices=["npz", "npy"], default="npz")
     ap.add_argument("--cache-in-mem", type=int, default=16)
     ap.add_argument("--cache-z-in-mem", type=int, choices=[0,1], default=0)
+    # prefilter index cache control
+    ap.add_argument("--prefilter-cache-refresh", action="store_true", help="force rebuild the prefilter index")
+    ap.add_argument("--prefilter-cache-off", action="store_true", help="disable prefilter index and run full scan")
+    ap.add_argument("--prefilter-workers", type=int, default=min(os.cpu_count() or 8, 8), help="parallel workers for prefilter/index build (I/O-bound)")
+    ap.add_argument("--prefilter-progress", type=int, choices=[0,1], default=1, help="show tqdm progress bars during prefilter (default: on)")
     # wandb logging
     ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="tfdna_affinity", help="wandb project name")
@@ -131,9 +137,27 @@ def main() -> None:
                             cache_format=args.cache_format,
                             cache_in_mem=args.cache_in_mem,
                             cache_z_in_mem=args.cache_z_in_mem,
+                            prefilter_cache_refresh=bool(args.prefilter_cache_refresh),
+                            prefilter_cache_off=bool(args.prefilter_cache_off),
+                            prefilter_workers=int(args.prefilter_workers),
+                            prefilter_progress=bool(args.prefilter_progress),
                             pin_memory=bool(args.pin_memory),
                             prefetch_factor=args.prefetch_factor)
     dm.setup()
+
+    # If we're only refreshing the prefilter cache, summarize and exit early
+    if args.prefilter_cache_refresh:
+        index_path = os.path.join(args.cache_dir or ".", "prefilter_index.json") if args.cache_dir else ""
+        idx = read_json(index_path) if index_path else None
+        if isinstance(idx, dict) and "dirs" in idx and "meta" in idx:
+            dirs_map = idx.get("dirs", {})
+            total = int(idx.get("meta", {}).get("dir_count", len(dirs_map)))
+            valid = sum(1 for v in dirs_map.values() if isinstance(v, dict) and bool(v.get("valid", False)))
+            changed_note = ""
+            print(f"[prefilter] index refreshed at {index_path}: valid={valid} / total={total}")
+        else:
+            print("[prefilter] index refresh requested, but index not found or invalid")
+        return
 
     c_pair, c_single, n_bins = infer_dims_from_datamodule(dm)
     lit = AffinityLightningModule(c_pair=c_pair,
