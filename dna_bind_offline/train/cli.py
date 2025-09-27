@@ -76,6 +76,7 @@ def main() -> None:
     ap.add_argument("--prefilter-cache-off", action="store_true", help="disable prefilter index and run full scan")
     ap.add_argument("--prefilter-workers", type=int, default=min(os.cpu_count() or 8, 8), help="parallel workers for prefilter/index build (I/O-bound)")
     ap.add_argument("--prefilter-progress", type=int, choices=[0,1], default=1, help="show tqdm progress bars during prefilter (default: on)")
+    ap.add_argument("--prefilter-verbose", type=int, choices=[0,1], default=0, help="print first parse/mask error per invalid dir during prefilter")
     # wandb logging
     ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="tfdna_affinity", help="wandb project name")
@@ -141,6 +142,7 @@ def main() -> None:
                             prefilter_cache_off=bool(args.prefilter_cache_off),
                             prefilter_workers=int(args.prefilter_workers),
                             prefilter_progress=bool(args.prefilter_progress),
+                            prefilter_verbose=bool(args.prefilter_verbose),
                             pin_memory=bool(args.pin_memory),
                             prefetch_factor=args.prefetch_factor)
     dm.setup()

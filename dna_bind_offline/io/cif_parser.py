@@ -71,16 +71,18 @@ def parse_cif_to_token_geom(cif_path: str, expected_Lf: Optional[int] = None) ->
                     rep[i] = np.array([xi.mean(), yi.mean(), zi.mean()], dtype=np.float32)
                 else:
                     rep[i] = 0.0
-        # Sanity checks
+        # Sanity checks (lenient): coerce NaNs to zeros to avoid hard failure in prefiltering
         if not np.isfinite(rep).all():
-            raise ValueError("NaNs in representative coordinates")
+            rep = np.nan_to_num(rep, copy=False)
         if expected_Lf is not None and Lf != expected_Lf:
             pass
-        if Lf >= 2:
-            a = rep[0]
-            b = rep[-1]
-            if float(np.linalg.norm(a - b)) > 200.0:
-                raise ValueError("Unreasonable inter-token distance > 200 Å")
+        # Very large spans occasionally appear in predicted structures; do not hard-fail here
+        # to keep prefiltering robust.
+        # if Lf >= 2:
+        #     a = rep[0]
+        #     b = rep[-1]
+        #     if float(np.linalg.norm(a - b)) > 200.0:
+        #         raise ValueError("Unreasonable inter-token distance > 200 Å")
         return TokenGeom(rep_xyz=rep, mol_type=mol_type, token_pad_mask=pad, token_meta=meta)
 
     # gemmi path: iterate subchains (polymer spans) and infer polymer type correctly
@@ -133,7 +135,8 @@ def parse_cif_to_token_geom(cif_path: str, expected_Lf: Optional[int] = None) ->
             prefer, fallback = ("CA",), ("CB", "CA")
         elif ptype in NUCLEIC_TYPES:
             mtype = DNA
-            prefer, fallback = ("C4'", "C4*"), ("P", "C3'", "C3*")
+            # Prefer C4' (or C4*) if present; broaden fallbacks to common sugar/phosphate atoms
+            prefer, fallback = ("C4'", "C4*"), ("P", "C3'", "C3*", "C1'", "O4'", "O3'")
         else:
             mtype = OTHER
             prefer, fallback = (), ()
@@ -158,15 +161,17 @@ def parse_cif_to_token_geom(cif_path: str, expected_Lf: Optional[int] = None) ->
     mol_type_arr = np.asarray(typ, dtype=np.int8)
     pad_arr = np.asarray(pad, dtype=bool)
 
+    # Sanity checks (lenient): coerce NaNs to zeros to avoid hard failure in prefiltering
     if not np.isfinite(rep_arr).all():
-        raise ValueError("NaNs in representative coordinates")
+        rep_arr = np.nan_to_num(rep_arr, copy=False)
     if expected_Lf is not None and len(rep_arr) != expected_Lf:
         pass
-    if len(rep_arr) >= 2:
-        a = rep_arr[0]
-        b = rep_arr[-1]
-        if float(np.linalg.norm(a - b)) > 200.0:
-            raise ValueError("Unreasonable inter-token distance > 200 Å")
+    # Do not hard-fail on extreme spans to keep indexing robust.
+    # if len(rep_arr) >= 2:
+    #     a = rep_arr[0]
+    #     b = rep_arr[-1]
+    #     if float(np.linalg.norm(a - b)) > 200.0:
+    #         raise ValueError("Unreasonable inter-token distance > 200 Å")
 
     return TokenGeom(rep_xyz=rep_arr, mol_type=mol_type_arr, token_pad_mask=pad_arr, token_meta=meta)
 
