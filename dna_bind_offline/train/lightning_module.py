@@ -42,7 +42,12 @@ class AffinityLightningModule(pl.LightningModule):
             prior_eps=prior_eps,
             heads=heads,
         )
-        self.loss_mse = nn.MSELoss()
+        # Robust base loss: Huber (a.k.a. SmoothL1)
+        try:
+            self.loss_mse = nn.SmoothL1Loss(beta=0.5)
+        except TypeError:
+            # Fallback if beta not supported by installed torch
+            self.loss_mse = nn.SmoothL1Loss()
         self.val_store: Dict[str, List[Tuple[float, float]]] = {}
         self.test_store: Dict[str, List[Tuple[float, float]]] = {}
         self.normalize: str = "none"
@@ -73,6 +78,12 @@ class AffinityLightningModule(pl.LightningModule):
         y = batch.y.to(self.device).reshape(1)
         y_hat, _ = self.forward(batch)
         loss = self.loss_mse(y_hat, y)
+        # Optional correlation-aware auxiliary (only meaningful for per-TF mini-batches)
+        try:
+            if getattr(self.hparams, "corr_w", 0.0) > 0.0 and y.numel() >= 3:
+                loss = loss + float(self.hparams.corr_w) * self.corr_penalty(y_hat, y)
+        except Exception:
+            pass
         with torch.no_grad():
             mse = self.loss_mse(y_hat, y)
         self.log("train/mse", mse, on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
@@ -131,6 +142,8 @@ class AffinityLightningModule(pl.LightningModule):
         per_tf_r: List[float] = []
         per_tf_s: List[float] = []
         per_tf_nmse: List[float] = []
+        per_tf_mae: List[float] = []
+        per_tf_r2: List[float] = []
         for tf, pairs in self.val_store.items():
             ys, yh = zip(*pairs)
             ys_arr = np.asarray(ys, dtype=np.float64)
@@ -139,19 +152,33 @@ class AffinityLightningModule(pl.LightningModule):
             s = self._spearman(ys_arr.tolist(), yh_arr.tolist())
             var_y = float(np.var(ys_arr)) if len(ys_arr) > 1 else 0.0
             mse = float(np.mean((yh_arr - ys_arr) ** 2))
+            mae = float(np.mean(np.abs(yh_arr - ys_arr)))
             nmse = float(mse / max(var_y, 1e-8)) if var_y > 0 else float("nan")
+            r2 = float(1.0 - nmse) if np.isfinite(nmse) else float("nan")
             if np.isfinite(r):
                 per_tf_r.append(r)
             if np.isfinite(s):
                 per_tf_s.append(s)
             if np.isfinite(nmse):
                 per_tf_nmse.append(nmse)
+            if np.isfinite(mae):
+                per_tf_mae.append(mae)
+            if np.isfinite(r2):
+                per_tf_r2.append(r2)
         r_mean = float(np.mean(per_tf_r)) if per_tf_r else float("nan")
         s_mean = float(np.mean(per_tf_s)) if per_tf_s else float("nan")
         nmse_mean = float(np.mean(per_tf_nmse)) if per_tf_nmse else float("nan")
+        r_median = float(np.median(per_tf_r)) if per_tf_r else float("nan")
+        s_median = float(np.median(per_tf_s)) if per_tf_s else float("nan")
+        mae_mean = float(np.mean(per_tf_mae)) if per_tf_mae else float("nan")
+        r2_mean = float(np.mean(per_tf_r2)) if per_tf_r2 else float("nan")
         self.log("val/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False)
         self.log("val/num_tfs", torch.tensor(len(self.val_store)), on_step=False, on_epoch=True, prog_bar=False)
 
     def test_step(self, batch: Sample, batch_idx: int) -> None:
@@ -174,6 +201,8 @@ class AffinityLightningModule(pl.LightningModule):
         per_tf_r: List[float] = []
         per_tf_s: List[float] = []
         per_tf_nmse: List[float] = []
+        per_tf_mae: List[float] = []
+        per_tf_r2: List[float] = []
         for tf, pairs in self.test_store.items():
             ys, yh = zip(*pairs)
             ys_arr = np.asarray(ys, dtype=np.float64)
@@ -182,19 +211,33 @@ class AffinityLightningModule(pl.LightningModule):
             s = self._spearman(ys_arr.tolist(), yh_arr.tolist())
             var_y = float(np.var(ys_arr)) if len(ys_arr) > 1 else 0.0
             mse = float(np.mean((yh_arr - ys_arr) ** 2))
+            mae = float(np.mean(np.abs(yh_arr - ys_arr)))
             nmse = float(mse / max(var_y, 1e-8)) if var_y > 0 else float("nan")
+            r2 = float(1.0 - nmse) if np.isfinite(nmse) else float("nan")
             if np.isfinite(r):
                 per_tf_r.append(r)
             if np.isfinite(s):
                 per_tf_s.append(s)
             if np.isfinite(nmse):
                 per_tf_nmse.append(nmse)
+            if np.isfinite(mae):
+                per_tf_mae.append(mae)
+            if np.isfinite(r2):
+                per_tf_r2.append(r2)
         r_mean = float(np.mean(per_tf_r)) if per_tf_r else float("nan")
         s_mean = float(np.mean(per_tf_s)) if per_tf_s else float("nan")
         nmse_mean = float(np.mean(per_tf_nmse)) if per_tf_nmse else float("nan")
+        r_median = float(np.median(per_tf_r)) if per_tf_r else float("nan")
+        s_median = float(np.median(per_tf_s)) if per_tf_s else float("nan")
+        mae_mean = float(np.mean(per_tf_mae)) if per_tf_mae else float("nan")
+        r2_mean = float(np.mean(per_tf_r2)) if per_tf_r2 else float("nan")
         self.log("test/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False)
 
     def configure_optimizers(self):
         use_fused = torch.cuda.is_available()
