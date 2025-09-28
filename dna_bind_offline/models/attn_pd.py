@@ -104,12 +104,16 @@ class PairBiasCrossAttentionPD(nn.Module):
                 pb = prior_bias.to(dtype=torch.float32)  # [Lc,Lc]
                 logits = logits + pb.unsqueeze(0)
 
-            # Mask out non-PD edges
+            # Mask out non-PD edges and make softmax safe for rows with no valid keys
             neg_inf = torch.finfo(torch.float32).min
             mask = pd_mask.to(device=device)
             logits = torch.where(mask.unsqueeze(0), logits, torch.tensor(neg_inf, device=logits.device, dtype=logits.dtype))
 
-            attn = torch.softmax(logits, dim=-1)  # [H, Lc, Lc]
+            row_has_any = mask.any(dim=-1)  # [Lc]
+            safe_logits = logits.clone()
+            safe_logits[:, ~row_has_any, :] = 0.0
+            attn = torch.softmax(safe_logits, dim=-1)  # [H, Lc, Lc]
+            attn[:, ~row_has_any, :] = 0.0
 
         attn = self.dropout(attn).to(dtype=dtype)
 

@@ -42,15 +42,14 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--val_frac", type=float, default=0.1)
-    ap.add_argument("--corr_w", type=float, default=0.05)
     ap.add_argument("--out", default="tfdna_affinity.ckpt")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--num_workers", type=int, default=min(os.cpu_count() or 8, 8))
+    ap.add_argument("--num_workers", type=int, default=min(os.cpu_count() or 16, 16))
     ap.add_argument("--prefetch_factor", type=int, default=4)
     ap.add_argument("--pin_memory", type=int, choices=[0,1], default=1)
     ap.add_argument("--devices", type=int, default=1)
-    ap.add_argument("--precision", type=str, default="16", choices=["32", "16", "bf16"])  # autocast precision
+    ap.add_argument("--precision", type=str, default="bf16", choices=["32", "16", "bf16"])  # autocast precision
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--normalize", type=str, default="none", choices=["none", "zscore_per_tf"], help="label normalization strategy")
     # attention head
@@ -65,7 +64,7 @@ def main() -> None:
     # cache
     ap.add_argument("--cache-dir", type=str, default="runs_cache")
     ap.add_argument("--cache-format", type=str, choices=["npz", "npy"], default="npz")
-    ap.add_argument("--cache-in-mem", type=int, default=16)
+    ap.add_argument("--cache-in-mem", type=int, default=128)
     ap.add_argument("--cache-z-in-mem", action="store_true", help="keep z tensors in memory cache for speed")
     # prefilter index cache control
     ap.add_argument("--prefilter-cache-refresh", action="store_true", help="force rebuild the prefilter index")
@@ -163,13 +162,8 @@ def main() -> None:
                                   n_bins=n_bins,
                                   lr=args.lr,
                                   weight_decay=args.wd,
-                                  corr_w=args.corr_w,
                                   attn_dropout=args.attn_dropout,
                                   noise_std=args.noise_std,
-                                  prior_w_contact=args.prior_w_contact,
-                                  prior_w_pae=args.prior_w_pae,
-                                  prior_w_pde=args.prior_w_pde,
-                                  prior_eps=args.prior_eps,
                                   heads=args.heads)
     lit.normalize = args.normalize
     lit.train_stats = dm.train_stats
@@ -179,8 +173,9 @@ def main() -> None:
     accelerator = "cpu" if args.cpu or not torch.cuda.is_available() else "gpu"
     precision_map = {"32": "32-true", "16": "16-mixed", "bf16": "bf16-mixed"}
     strategy = "auto" if not (accelerator == "gpu" and args.devices > 1) else "ddp_find_unused_parameters_false"
+    mc = ModelCheckpoint(monitor="val/r_by_tf_mean", mode="max", save_top_k=1, filename="best")
     callbacks = [
-        ModelCheckpoint(monitor="val/r_by_tf_mean", mode="max", save_top_k=1, filename="best"),
+        mc,
         EarlyStopping(monitor="val/r_by_tf_mean", mode="max", patience=max(5, args.epochs // 10), min_delta=0.002),
     ]
     logger_obj = None
@@ -221,7 +216,7 @@ def main() -> None:
 
     trainer.fit(lit, datamodule=dm)
 
-    ckpt_path = trainer.checkpoint_callback.best_model_path if hasattr(trainer, "checkpoint_callback") else ""
+    ckpt_path = mc.best_model_path
     if ckpt_path and os.path.exists(ckpt_path):
         state = torch.load(ckpt_path, map_location="cpu")
         torch.save(state, args.out)

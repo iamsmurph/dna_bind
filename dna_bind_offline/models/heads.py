@@ -74,9 +74,16 @@ class BoltzAffinityHeadReplica(nn.Module):
             dist_bins_t = torch.from_numpy(dist_bins)
         else:
             dist_bins_t = dist_bins
-        if dist_bins_t.shape[:2] != (Lc, Lc):
-            raise ValueError("dist_bins must be [Lc,Lc,B]")
         device = z.device
+        # Densify PD-sparse RBFs [K,B] -> [Lc,Lc,B] when needed
+        if dist_bins_t.dim() == 2 or dist_bins_t.shape[:2] != (Lc, Lc):
+            if hasattr(masks, "pd_flat_idx"):
+                flat = torch.from_numpy(masks.pd_flat_idx).to(device=device, dtype=torch.long)
+                dense = torch.zeros((Lc, Lc, self.b_bins), dtype=dist_bins_t.dtype, device=device)
+                dense.view(-1, self.b_bins).index_copy_(0, flat, dist_bins_t.to(device=device))
+                dist_bins_t = dense
+            else:
+                raise ValueError("Need masks.pd_flat_idx to densify PD RBF bins")
         dist_bins_t = dist_bins_t.to(device=device, dtype=z.dtype)
         if dist_bins_t.shape[-1] != self.b_bins:
             raise AssertionError("b_bins must equal dist_bins last dim")
@@ -126,10 +133,10 @@ class BoltzAffinityHeadReplica(nn.Module):
         # SDPA over PD edges
         y, attn_w = self.attn(s=s_proxy, z=z, pd_mask=pd_mask.bool(), dist_bias_h=dist_bias_h, prior_bias=prior_bias)
 
-        # Pool over DNA tokens (columns in PD mask)
-        dna_mask = pd_mask.any(dim=0)
-        y_dna = y[dna_mask] if dna_mask.any() else y
-        pooled = y_dna.mean(dim=0)
+        # Pool over protein rows (rows with at least one PD edge)
+        prot_mask = pd_mask.any(dim=1)
+        y_prot = y[prot_mask] if prot_mask.any() else y
+        pooled = y_prot.mean(dim=0)
         aff_scalar = self.out_mlp(pooled).reshape(())
         outputs["attn_weights_pd"] = attn_w
         outputs["pooled_value"] = aff_scalar
