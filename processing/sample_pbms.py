@@ -55,8 +55,8 @@ def save_output(df, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Dedup (log->mean) and sample nt sequences per TF")
-    parser.add_argument("--input", type=str, default="/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_dataset.pkl", help="Path to input pickle dataset")
-    parser.add_argument("--output", type=str, default="/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_dedup_sampled.csv", help="Path to output CSV")
+    parser.add_argument("--input", type=str, default="/data/rbg/users/seanmurphy/dna_bind/datasets/uniprobe_dataset.pkl", help="Path to input pickle dataset")
+    parser.add_argument("--output", type=str, default="/data/rbg/users/seanmurphy/dna_bind/datasets/uniprobe_dedup_sampled.csv", help="Path to output CSV")
     parser.add_argument("--k", type=int, default=500, help="Number of nt sequences to sample per TF (default: 400)")
     parser.add_argument("--seed", type=int, default=1337, help="Random seed for sampling (default: 1337)")
     return parser.parse_args()

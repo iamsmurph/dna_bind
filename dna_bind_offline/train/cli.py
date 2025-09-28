@@ -32,7 +32,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preflight", action="store_true", help="run a label-vs-pred mapping summary before training")
     ap.add_argument("--preflight-only", action="store_true", help="only run preflight summary and exit")
-    ap.add_argument("--labels_csv", default="/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_subset_100tfs.csv", help="path to labels CSV with columns: uniprot, nt (or sequence), intensity_log1p")
+    ap.add_argument("--labels_csv", default="/data/rbg/users/seanmurphy/dna_bind/datasets/uniprobe_subset_100tfs.csv", help="path to labels CSV with columns: uniprot, nt (or sequence), intensity_log1p")
     ap.add_argument("--seq_col", default="nt", help="CSV column name for DNA sequence (default: nt)")
     ap.add_argument("--pred_glob", default="/data/rbg/users/ujp/dnabind/boltz_runs/uniprobe_subset_100tfs/boltz_results_chunk_*/predictions/*", help="glob matching Boltz prediction dirs (e.g., 'runs/*/*')")
     ap.add_argument("--split_by", default="tf", choices=["random", "tf"], help="how to split train/val (default: tf)")

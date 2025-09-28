@@ -1,7 +1,7 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
-data/
+datasets/
 .DS_Store
 venv/
 .venv/

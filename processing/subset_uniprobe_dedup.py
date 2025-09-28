@@ -8,7 +8,7 @@ import os
 import numpy as np
 import argparse
 #%%
-df = pd.read_csv("/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_dedup_sampled.csv")
+df = pd.read_csv("/data/rbg/users/seanmurphy/dna_bind/datasets/uniprobe_dedup_sampled.csv")
 #%%
 # Random sample n_tfs unique uniprot values
 n_tfs = 100
@@ -22,7 +22,7 @@ df = df[df['uniprot'].isin(sampled_uniprots)]
 
 # %%
 # Save the subsetted dataframe
-output_path = "/data/rbg/users/seanmurphy/dna_bind/data/uniprobe_subset_100tfs.csv"
+output_path = "/data/rbg/users/seanmurphy/dna_bind/datasets/uniprobe_subset_100tfs.csv"
 df.to_csv(output_path, index=False)
 print(f"Saved subsetted dataframe with {len(df)} rows and {len(df['uniprot'].unique())} unique TFs to {output_path}")
 
