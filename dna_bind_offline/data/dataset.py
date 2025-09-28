@@ -31,8 +31,7 @@ class Sample:
         self.s_proxy = self.s_proxy.pin_memory()
         if isinstance(self.dist_bins, torch.Tensor):
             self.dist_bins = self.dist_bins.pin_memory()
-        if isinstance(self.edge_weights, torch.Tensor):
-            self.edge_weights = self.edge_weights.pin_memory()
+        # edge_weights deprecated
         if isinstance(self.prior_contact, torch.Tensor):
             self.prior_contact = self.prior_contact.pin_memory()
         if isinstance(self.prior_pae, torch.Tensor):
@@ -74,7 +73,7 @@ class AffinityDataset:
         self.split = split
         self.normalize = normalize
         self.train_stats = train_stats or {}
-        self.dist_feats = dist_feats
+        self.dist_feats = "rbf"
         self.rbf_centers = int(rbf_centers)
         self.rbf_min = float(rbf_min)
         self.rbf_max = float(rbf_max)
@@ -152,12 +151,11 @@ class AffinityDataset:
             L_arr = data.get("L")
             pd_pairs_np = data.get("pd_pairs")
             pd_flat_idx_np = data.get("pd_flat_idx")
-            if self.dist_feats == "rbf":
-                dist_pd_np = data.get("dist_rbf_pd")
+            dist_pd_np = data.get("dist_rbf_pd")
             contact_pd_np = data.get("contact_pd")
             pae_pd_np = data.get("pae_pd")
             pde_pd_np = data.get("pde_pd")
-            if (self.dist_feats == "rbf") and isinstance(dist_pd_np, np.ndarray) and isinstance(pd_pairs_np, np.ndarray) and isinstance(L_arr, np.ndarray):
+            if isinstance(dist_pd_np, np.ndarray) and isinstance(pd_pairs_np, np.ndarray) and isinstance(L_arr, np.ndarray):
                 Lc = int(L_arr.reshape(-1)[0])
                 aff_mask = np.zeros((Lc, Lc), dtype=bool)
                 if pd_pairs_np.size:
@@ -200,7 +198,7 @@ class AffinityDataset:
             contact_pd_np = contact_c[i_idx, j_idx].astype(np.float16) if isinstance(contact_c, np.ndarray) else None
             pae_pd_np = pae_c[i_idx, j_idx].astype(np.float16) if isinstance(pae_c, np.ndarray) else None
             pde_pd_np = pde_c[i_idx, j_idx].astype(np.float16) if isinstance(pde_c, np.ndarray) else None
-            if self.dist_feats == "rbf":
+            if True:
                 coords = np.asarray(masks.rep_xyz_crop, dtype=np.float32)
                 D = np.linalg.norm(coords[i_idx] - coords[j_idx], axis=-1).astype(np.float32)
                 centers = np.linspace(self.rbf_min, self.rbf_max, self.rbf_centers, dtype=np.float32)
@@ -228,9 +226,9 @@ class AffinityDataset:
                     np.savez_compressed(f, **arrs)
                 os.replace(tmp, cache_path)
 
-        if self.dist_feats == "rbf" and isinstance(dist_pd_np, np.ndarray):
+        if isinstance(dist_pd_np, np.ndarray):
             dist_bins_t = self._to_pinned_half(dist_pd_np)
-        elif self.dist_feats == "rbf" and not isinstance(dist_pd_np, np.ndarray):
+        elif not isinstance(dist_pd_np, np.ndarray):
             coords = torch.from_numpy(masks.rep_xyz_crop.astype(np.float32))
             i_t = torch.from_numpy(i_idx.astype(np.int64))
             j_t = torch.from_numpy(j_idx.astype(np.int64))

@@ -7,7 +7,6 @@ from .geometry.distance_features import *  # noqa: F401,F403
 from .geometry.priors import *  # noqa: F401,F403
 from .geometry.sanity import *  # noqa: F401,F403
 from .models.types import *  # noqa: F401,F403
-from .models.pooling import *  # noqa: F401,F403
 from .models.heads import *  # noqa: F401,F403
 from .models.regressor import *  # noqa: F401,F403
 from .models.inference import *  # noqa: F401,F403

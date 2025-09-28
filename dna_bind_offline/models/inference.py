@@ -16,11 +16,10 @@ def predict_intensity(model: torch.nn.Module, sample) -> Tuple[float, Dict[str, 
         s = getattr(sample, "s_proxy")
     dist_bins = getattr(sample, "dist_bins")
     masks = getattr(sample, "masks")
-    edge_w = getattr(sample, "edge_weights", None)
 
     z = z.to(device)
     s = s.to(device)
-    y_hat, out = model(z, s, dist_bins, masks, edge_weights=edge_w)
+    y_hat, out = model(z, s, dist_bins, masks)
     return float(y_hat.detach().cpu().reshape(()).item()), out
 
 

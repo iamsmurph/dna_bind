@@ -53,15 +53,11 @@ def main() -> None:
     ap.add_argument("--precision", type=str, default="16", choices=["32", "16", "bf16"])  # autocast precision
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--normalize", type=str, default="none", choices=["none", "zscore_per_tf"], help="label normalization strategy")
-    # pooling & attention
-    ap.add_argument("--pooling", type=str, default="attention", choices=["lse", "attention"])
-    ap.add_argument("--attn-hidden", dest="attn_hidden", type=int, default=128)
+    # attention head
+    ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--attn-dropout", dest="attn_dropout", type=float, default=0.10)
-    ap.add_argument("--edge-dropout", dest="edge_dropout", type=float, default=0.10)
     ap.add_argument("--noise-std", dest="noise_std", type=float, default=0.02)
-    ap.add_argument("--pool-temp", dest="pool_temp", type=float, default=4.0)
-    # distance features
-    ap.add_argument("--dist-feats", dest="dist_feats", type=str, default="rbf", choices=["bins", "rbf"])
+    # distance features (RBF-only)
     ap.add_argument("--dist-rbf-centers", dest="dist_rbf_centers", type=int, default=64)
     ap.add_argument("--dist-rbf-min", dest="dist_rbf_min", type=float, default=2.0)
     ap.add_argument("--dist-rbf-max", dest="dist_rbf_max", type=float, default=22.0)
@@ -70,12 +66,12 @@ def main() -> None:
     ap.add_argument("--cache-dir", type=str, default="runs_cache")
     ap.add_argument("--cache-format", type=str, choices=["npz", "npy"], default="npz")
     ap.add_argument("--cache-in-mem", type=int, default=16)
-    ap.add_argument("--cache-z-in-mem", type=int, choices=[0,1], default=0)
+    ap.add_argument("--cache-z-in-mem", action="store_true", help="keep z tensors in memory cache for speed")
     # prefilter index cache control
     ap.add_argument("--prefilter-cache-refresh", action="store_true", help="force rebuild the prefilter index")
     ap.add_argument("--prefilter-cache-off", action="store_true", help="disable prefilter index and run full scan")
     ap.add_argument("--prefilter-workers", type=int, default=min(os.cpu_count() or 8, 8), help="parallel workers for prefilter/index build (I/O-bound)")
-    ap.add_argument("--prefilter-progress", type=int, choices=[0,1], default=1, help="show tqdm progress bars during prefilter (default: on)")
+    # default progress on; no toggle
     ap.add_argument("--prefilter-verbose", type=int, choices=[0,1], default=0, help="print first parse/mask error per invalid dir during prefilter")
     # wandb logging
     ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
@@ -129,7 +125,7 @@ def main() -> None:
                             normalize=args.normalize,
                             test_glob=args.test_glob,
                             test_labels_csv=args.test_labels_csv,
-                            dist_feats=args.dist_feats,
+                            dist_feats="rbf",
                             rbf_centers=args.dist_rbf_centers,
                             rbf_min=args.dist_rbf_min,
                             rbf_max=args.dist_rbf_max,
@@ -137,11 +133,11 @@ def main() -> None:
                             cache_dir=args.cache_dir,
                             cache_format=args.cache_format,
                             cache_in_mem=args.cache_in_mem,
-                            cache_z_in_mem=args.cache_z_in_mem,
+                            cache_z_in_mem=1 if args.cache_z_in_mem else 0,
                             prefilter_cache_refresh=bool(args.prefilter_cache_refresh),
                             prefilter_cache_off=bool(args.prefilter_cache_off),
                             prefilter_workers=int(args.prefilter_workers),
-                            prefilter_progress=bool(args.prefilter_progress),
+                            prefilter_progress=True,
                             prefilter_verbose=bool(args.prefilter_verbose),
                             pin_memory=bool(args.pin_memory),
                             prefetch_factor=args.prefetch_factor)
@@ -168,17 +164,13 @@ def main() -> None:
                                   lr=args.lr,
                                   weight_decay=args.wd,
                                   corr_w=args.corr_w,
-                                  use_soft_pool=True,
-                                  pooling=args.pooling,
-                                  attn_hidden=args.attn_hidden,
                                   attn_dropout=args.attn_dropout,
-                                  edge_dropout=args.edge_dropout,
-                                  pool_temp=args.pool_temp,
                                   noise_std=args.noise_std,
                                   prior_w_contact=args.prior_w_contact,
                                   prior_w_pae=args.prior_w_pae,
                                   prior_w_pde=args.prior_w_pde,
-                                  prior_eps=args.prior_eps)
+                                  prior_eps=args.prior_eps,
+                                  heads=args.heads)
     lit.normalize = args.normalize
     lit.train_stats = dm.train_stats
 

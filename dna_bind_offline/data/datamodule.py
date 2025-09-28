@@ -78,7 +78,7 @@ class AffinityDataModule(pl.LightningDataModule):
         self.normalize = normalize
         self.test_glob = test_glob
         self.test_labels_csv = test_labels_csv
-        self.dist_feats = dist_feats
+        self.dist_feats = "rbf"
         self.rbf_centers = int(rbf_centers)
         self.rbf_min = float(rbf_min)
         self.rbf_max = float(rbf_max)
@@ -92,7 +92,7 @@ class AffinityDataModule(pl.LightningDataModule):
         self.prefilter_cache_refresh = bool(prefilter_cache_refresh)
         self.prefilter_cache_off = bool(prefilter_cache_off)
         self.prefilter_workers = int(max(1, prefilter_workers))
-        self.prefilter_progress = bool(prefilter_progress)
+        self.prefilter_progress = True
         self.prefilter_verbose = bool(prefilter_verbose)
         self.labels: Dict[Tuple[str, str], float] = {}
         self.train_ds: Optional[AffinityDataset] = None

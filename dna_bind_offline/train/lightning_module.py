@@ -21,34 +21,26 @@ class AffinityLightningModule(pl.LightningModule):
                  lr: float = 1e-3,
                  weight_decay: float = 0.0,
                  corr_w: float = 0.05,
-                 use_soft_pool: bool = True,
-                 pooling: str = "attention",
-                 attn_hidden: int = 128,
                  attn_dropout: float = 0.10,
-                 edge_dropout: float = 0.10,
-                 pool_temp: float = 4.0,
                  noise_std: float = 0.02,
                  prior_w_contact: float = 1.0,
                  prior_w_pae: float = 0.25,
                  prior_w_pde: float = 0.10,
-                 prior_eps: float = 1e-6) -> None:
+                 prior_eps: float = 1e-6,
+                 heads: int = 8) -> None:
         super().__init__()
         self.save_hyperparameters()
         self.model = TFAffinityRegressor(
             c_pair=c_pair,
             c_single=c_single,
             n_bins=n_bins,
-            use_soft_pool=use_soft_pool,
-            pooling=pooling,
-            attn_hidden=attn_hidden,
             attn_dropout=attn_dropout,
-            edge_dropout=edge_dropout,
-            pool_temp=pool_temp,
             noise_std=noise_std,
             prior_w_contact=prior_w_contact,
             prior_w_pae=prior_w_pae,
             prior_w_pde=prior_w_pde,
             prior_eps=prior_eps,
+            heads=heads,
         )
         self.loss_mse = nn.MSELoss()
         self.val_store: Dict[str, List[Tuple[float, float]]] = {}
@@ -70,11 +62,10 @@ class AffinityLightningModule(pl.LightningModule):
         if isinstance(dist_bins, np.ndarray):
             dist_bins = torch.from_numpy(dist_bins)
         dist_bins = dist_bins.to(device=device, dtype=z.dtype, non_blocking=True)
-        edge_w = batch.edge_weights.to(device, non_blocking=True) if batch.edge_weights is not None else None
         prior_c = batch.prior_contact.to(device, non_blocking=True) if isinstance(batch.prior_contact, torch.Tensor) else None
         prior_pae = batch.prior_pae.to(device, non_blocking=True) if isinstance(batch.prior_pae, torch.Tensor) else None
         prior_pde = batch.prior_pde.to(device, non_blocking=True) if isinstance(batch.prior_pde, torch.Tensor) else None
-        y_hat, out = self.model(z, s, dist_bins, batch.masks, edge_weights=edge_w,
+        y_hat, out = self.model(z, s, dist_bins, batch.masks,
                                 prior_contact=prior_c, prior_pae=prior_pae, prior_pde=prior_pde)
         return y_hat, out
 
