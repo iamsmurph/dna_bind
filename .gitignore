@@ -18,3 +18,11 @@ msa+checkpoints/
 boltz/scripts/debug/*.pt
 
 runs_cache/
+
+# Experiment logs and trackers
+lightning_logs/
+wandb/
+
+# Common artifacts
+*.ckpt
+*.log
