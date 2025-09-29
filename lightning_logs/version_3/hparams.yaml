@@ -1,0 +1,13 @@
+attn_dropout: 0.1
+c_pair: 128
+c_single: 384
+corr_w: 0.0
+heads: 8
+lr: 0.001
+n_bins: 64
+noise_std: 0.02
+prior_eps: 1.0e-06
+prior_w_contact: 1.0
+prior_w_pae: 0.25
+prior_w_pde: 0.1
+weight_decay: 0.0

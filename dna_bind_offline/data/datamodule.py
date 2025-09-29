@@ -34,7 +34,14 @@ def read_labels(csv_path: str, seq_col: str = "nt") -> Dict[Tuple[str, str], flo
 
 
 def single_collate(batch: List[Sample]) -> Sample:
-    return batch[0]
+    sample = batch[0]
+    # Ensure pinned host memory for faster H2D copies when using CUDA
+    try:
+        if torch.cuda.is_available():
+            return sample.pin_memory()
+    except Exception:
+        pass
+    return sample
 
 
 class AffinityDataModule(pl.LightningDataModule):
@@ -78,7 +85,7 @@ class AffinityDataModule(pl.LightningDataModule):
         self.normalize = normalize
         self.test_glob = test_glob
         self.test_labels_csv = test_labels_csv
-        self.dist_feats = "rbf"
+        self.dist_feats = dist_feats
         self.rbf_centers = int(rbf_centers)
         self.rbf_min = float(rbf_min)
         self.rbf_max = float(rbf_max)
@@ -100,7 +107,20 @@ class AffinityDataModule(pl.LightningDataModule):
         self.test_ds: Optional[AffinityDataset] = None
         self.train_stats: Dict[str, Tuple[float, float]] = {}
 
+        # Pipeline assumes single-sample batches due to single_collate; guard against silent misuse
+        if self.batch_size != 1:
+            raise ValueError("This pipeline currently assumes batch_size=1 due to single_collate; got batch_size!=1")
+
+    def prepare_data(self) -> None:
+        # Place for one-time, rank-0 work (e.g., building/refreshing prefilter index on disk)
+        # Our setup() builds/refreshes the index as needed; leaving this as a no-op keeps behavior unchanged
+        # while allowing Lightning to call it only once per run on rank 0.
+        return
+
     def setup(self, stage: Optional[str] = None) -> None:
+        # Idempotent: if datasets are already constructed, avoid re-running prefilter/index
+        if self.train_ds is not None and self.val_ds is not None:
+            return
         import glob as globlib
         self.labels = read_labels(self.labels_csv, seq_col=self.seq_col)
         all_dirs = sorted(globlib.glob(os.path.join(self.pred_glob)))
@@ -402,6 +422,44 @@ class AffinityDataModule(pl.LightningDataModule):
             train_tfs = set(tf_ids[n_val_tf:])
             train_dirs = [d for tf in train_tfs for d in tf_to_dirs[tf]]
             val_dirs = [d for tf in val_tfs for d in tf_to_dirs[tf]]
+
+        # Filter dirs to those with labels (with trailing-T tolerant normalization)
+        def _normalize_key(k: Tuple[str, str]) -> Tuple[str, str]:
+            u, s = k
+            return (u, s[:-1]) if s.endswith("T") else (u, s)
+
+        label_keys_raw = set(self.labels.keys())
+        label_keys_tol = {_normalize_key(k) for k in label_keys_raw}
+
+        def _dir_key(d: str) -> Tuple[str, str]:
+            try:
+                u, _, s = parse_prediction_dir_name(d)
+                return (u, s)
+            except Exception:
+                try:
+                    bundle = load_crop_bundle(d, device=torch.device("cpu"))
+                    return (str(bundle.meta.get("uniprot", "")), str(bundle.meta.get("sequence", "")))
+                except Exception:
+                    name = os.path.basename(d.rstrip("/"))
+                    parts = name.split("_", 2)
+                    if len(parts) >= 3:
+                        return (parts[0], parts[2])
+                    return ("", "")
+
+        def _filter_dirs(dirs_in: List[str], split_name: str) -> List[str]:
+            keys = [_dir_key(d) for d in dirs_in]
+            keys_tol = [_normalize_key(k) for k in keys]
+            keep = [((k in label_keys_raw) or (kt in label_keys_tol)) for k, kt in zip(keys, keys_tol)]
+            kept = [d for d, ok in zip(dirs_in, keep) if ok]
+            dropped = len(dirs_in) - len(kept)
+            if dropped:
+                print(f"[dataset] {split_name}: kept={len(kept)} dropped={dropped} (from {len(dirs_in)})")
+            else:
+                print(f"[dataset] {split_name}: kept={len(kept)} dropped=0 (from {len(dirs_in)})")
+            return kept
+
+        train_dirs = _filter_dirs(train_dirs, "train")
+        val_dirs = _filter_dirs(val_dirs, "val")
 
         self.train_stats = {}
         if self.normalize == "zscore_per_tf":

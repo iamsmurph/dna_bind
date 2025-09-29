@@ -20,7 +20,7 @@ class AffinityLightningModule(pl.LightningModule):
                  n_bins: int,
                  lr: float = 1e-3,
                  weight_decay: float = 0.0,
-                 corr_w: float = 0.05,
+                 corr_w: float = 0.0,
                  attn_dropout: float = 0.10,
                  noise_std: float = 0.02,
                  prior_w_contact: float = 1.0,
@@ -102,7 +102,7 @@ class AffinityLightningModule(pl.LightningModule):
         y_raw = batch.y.detach().cpu().reshape(()).item()
         self.val_store.setdefault(uniprot, []).append((y_raw, yhat_raw))
         mse = torch.tensor((yhat_raw - y_raw) ** 2, dtype=torch.float32)
-        self.log("val/mse_point", mse, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False, batch_size=1)
+        self.log("val/mse_point", mse, on_step=False, on_epoch=True, prog_bar=False, sync_dist=False, batch_size=1)
 
     def on_validation_epoch_start(self) -> None:
         self.val_store = {}

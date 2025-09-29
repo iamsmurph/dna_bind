@@ -73,7 +73,7 @@ class AffinityDataset:
         self.split = split
         self.normalize = normalize
         self.train_stats = train_stats or {}
-        self.dist_feats = "rbf"
+        self.dist_feats = dist_feats
         self.rbf_centers = int(rbf_centers)
         self.rbf_min = float(rbf_min)
         self.rbf_max = float(rbf_max)
@@ -217,7 +217,7 @@ class AffinityDataset:
                     "pd_flat_idx": masks.pd_flat_idx.astype(np.int64),
                     "contact_pd": contact_pd_np if contact_pd_np is not None else np.array([], dtype=np.float16),
                     "pae_pd": pae_pd_np if pae_pd_np is not None else np.array([], dtype=np.float16),
-                    "pde_pd": pde_pd_np if pae_pd_np is not None else np.array([], dtype=np.float16),
+                    "pde_pd": pde_pd_np if pde_pd_np is not None else np.array([], dtype=np.float16),
                 }
                 if dist_pd_np is not None:
                     arrs["dist_rbf_pd"] = dist_pd_np

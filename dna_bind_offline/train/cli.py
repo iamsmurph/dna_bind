@@ -49,8 +49,10 @@ def main() -> None:
     ap.add_argument("--prefetch_factor", type=int, default=4)
     ap.add_argument("--pin_memory", type=int, choices=[0,1], default=1)
     ap.add_argument("--devices", type=int, default=1)
-    ap.add_argument("--precision", type=str, default="bf16", choices=["32", "16", "bf16"])  # autocast precision
+    ap.add_argument("--precision", type=str, default="auto", choices=["auto", "32", "16", "bf16"])  # autocast precision
     ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--log_every_n_steps", type=int, default=1)
+    ap.add_argument("--check_val_every_n_epoch", type=int, default=1)
     ap.add_argument("--normalize", type=str, default="none", choices=["none", "zscore_per_tf"], help="label normalization strategy")
     # attention head
     ap.add_argument("--heads", type=int, default=8)
@@ -72,6 +74,12 @@ def main() -> None:
     ap.add_argument("--prefilter-workers", type=int, default=min(os.cpu_count() or 8, 8), help="parallel workers for prefilter/index build (I/O-bound)")
     # default progress on; no toggle
     ap.add_argument("--prefilter-verbose", type=int, choices=[0,1], default=0, help="print first parse/mask error per invalid dir during prefilter")
+    # priors and correlation penalty
+    ap.add_argument("--corr-w", type=float, default=0.0, help="weight for correlation penalty (requires minibatches)")
+    ap.add_argument("--prior-w-contact", type=float, default=1.0)
+    ap.add_argument("--prior-w-pae", type=float, default=0.25)
+    ap.add_argument("--prior-w-pde", type=float, default=0.10)
+    ap.add_argument("--prior-eps", type=float, default=1e-6)
     # wandb logging
     ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="tfdna_affinity", help="wandb project name")
@@ -157,13 +165,26 @@ def main() -> None:
         return
 
     c_pair, c_single, n_bins = infer_dims_from_datamodule(dm)
+    # Validate heads divisibility; fail fast with a clear suggestion
+    if (c_single % args.heads) != 0:
+        divisors = [d for d in range(1, min(c_single, args.heads) + 1) if c_single % d == 0]
+        fallback = max(divisors) if divisors else 1
+        raise SystemExit(
+            f"[config] c_single={c_single} not divisible by heads={args.heads}. "
+            f"Try --heads {fallback} or any divisor of {c_single}."
+        )
     lit = AffinityLightningModule(c_pair=c_pair,
                                   c_single=c_single,
                                   n_bins=n_bins,
                                   lr=args.lr,
                                   weight_decay=args.wd,
+                                  corr_w=args.corr_w,
                                   attn_dropout=args.attn_dropout,
                                   noise_std=args.noise_std,
+                                  prior_w_contact=args.prior_w_contact,
+                                  prior_w_pae=args.prior_w_pae,
+                                  prior_w_pde=args.prior_w_pde,
+                                  prior_eps=args.prior_eps,
                                   heads=args.heads)
     lit.normalize = args.normalize
     lit.train_stats = dm.train_stats
@@ -171,6 +192,17 @@ def main() -> None:
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
     accelerator = "cpu" if args.cpu or not torch.cuda.is_available() else "gpu"
+    # Select precision automatically when requested
+    major = 0
+    try:
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+    except Exception:
+        pass
+    if args.precision == "auto":
+        prec_key = "bf16" if (torch.cuda.is_available() and major >= 8) else "16"
+    else:
+        prec_key = args.precision
     precision_map = {"32": "32-true", "16": "16-mixed", "bf16": "bf16-mixed"}
     strategy = "auto" if not (accelerator == "gpu" and args.devices > 1) else "ddp_find_unused_parameters_false"
     mc = ModelCheckpoint(monitor="val/r_by_tf_mean", mode="max", save_top_k=1, filename="best")
@@ -207,11 +239,13 @@ def main() -> None:
         devices=args.devices if accelerator == "gpu" else 1,
         strategy=strategy,
         callbacks=callbacks,
-        precision=precision_map[args.precision],
-        log_every_n_steps=1,
+        precision=precision_map[prec_key],
+        log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=args.grad_clip,
+        accumulate_grad_batches=16,
         deterministic=False,
         logger=logger_obj,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
     )
 
     trainer.fit(lit, datamodule=dm)

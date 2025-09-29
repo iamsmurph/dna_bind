@@ -113,7 +113,8 @@ class PairBiasCrossAttentionPD(nn.Module):
             safe_logits = logits.clone()
             safe_logits[:, ~row_has_any, :] = 0.0
             attn = torch.softmax(safe_logits, dim=-1)  # [H, Lc, Lc]
-            attn[:, ~row_has_any, :] = 0.0
+            valid_row = row_has_any.view(1, -1, 1)
+            attn = attn.masked_fill(~valid_row, 0.0)
 
         attn = self.dropout(attn).to(dtype=dtype)
 
