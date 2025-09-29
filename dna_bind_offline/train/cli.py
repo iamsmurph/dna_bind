@@ -8,6 +8,9 @@ from typing import Tuple
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
+import multiprocessing as _mp
+import resource
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
@@ -29,6 +32,21 @@ def infer_dims_from_datamodule(dm: AffinityDataModule) -> Tuple[int, int, int]:
 
 
 def main() -> None:
+    # Prefer node-local tmp for PyTorch interprocess sharing to avoid NFS
+    try:
+        DEFAULT_TMP = "/storage/seanmurphy/tmp_ipc"
+        os.environ.setdefault("TMPDIR", DEFAULT_TMP)
+        try:
+            os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+        except Exception:
+            pass
+        try:
+            mp.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--preflight", action="store_true", help="run a label-vs-pred mapping summary before training")
     ap.add_argument("--preflight-only", action="store_true", help="only run preflight summary and exit")
@@ -45,10 +63,12 @@ def main() -> None:
     ap.add_argument("--out", default="tfdna_affinity.ckpt")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--num_workers", type=int, default=min(os.cpu_count() or 16, 16))
-    ap.add_argument("--prefetch_factor", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--prefetch_factor", type=int, default=1)
     ap.add_argument("--pin_memory", type=int, choices=[0,1], default=1)
     ap.add_argument("--devices", type=int, default=1)
+    ap.add_argument("--persistent-workers", type=int, choices=[0,1], default=0, help="use persistent_workers in DataLoader")
+    ap.add_argument("--mp-context", type=str, choices=["default", "forkserver", "spawn", "fork"], default="default", help="multiprocessing context for DataLoader workers")
     ap.add_argument("--precision", type=str, default="auto", choices=["auto", "32", "16", "bf16"])  # autocast precision
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--log_every_n_steps", type=int, default=1)
@@ -68,6 +88,7 @@ def main() -> None:
     ap.add_argument("--cache-format", type=str, choices=["npz", "npy"], default="npz")
     ap.add_argument("--cache-in-mem", type=int, default=128)
     ap.add_argument("--cache-z-in-mem", action="store_true", help="keep z tensors in memory cache for speed")
+    ap.add_argument("--allow-worker-tensor-cache", action="store_true", help="DANGEROUS: allow in-worker tensor cache when num_workers>0")
     # prefilter index cache control
     ap.add_argument("--prefilter-cache-refresh", action="store_true", help="force rebuild the prefilter index")
     ap.add_argument("--prefilter-cache-off", action="store_true", help="disable prefilter index and run full scan")
@@ -90,7 +111,27 @@ def main() -> None:
     ap.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"], default="online", help="wandb mode")
     ap.add_argument("--wandb_dir", type=str, default="/data/rbg/users/seanmurphy/dna_bind/wandb", help="local directory for wandb files")
     ap.add_argument("--wandb_log_model", action="store_true", help="log model checkpoints to wandb")
+    # diagnostics
+    ap.add_argument("--fd-monitor-interval", type=int, default=0, help="if >0, log open FD count every N training steps (main process)")
     args = ap.parse_args()
+    # Log RLIMIT_NOFILE at startup for visibility
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print(f"[runtime] RLIMIT_NOFILE soft={soft} hard={hard}")
+    except Exception:
+        pass
+
+    # If epochs==0, run a single-process cache build and exit
+    cache_build_only = (args.epochs == 0)
+    if cache_build_only:
+        # Enforce safe settings for the cache build pass
+        if args.num_workers != 0:
+            print("[cache-build] Forcing num_workers=0 for single-process cache build")
+        if args.pin_memory != 0:
+            print("[cache-build] Forcing pin_memory=0 for single-process cache build")
+        args.num_workers = 0
+        args.pin_memory = 0
+        args.prefetch_factor = 1
     if args.preflight or args.preflight_only:
         import csv as _csv, glob as _glob
         labels_set = set()
@@ -147,8 +188,44 @@ def main() -> None:
                             prefilter_progress=True,
                             prefilter_verbose=bool(args.prefilter_verbose),
                             pin_memory=bool(args.pin_memory),
-                            prefetch_factor=args.prefetch_factor)
+                            prefetch_factor=args.prefetch_factor,
+                            persistent_workers=bool(args.persistent_workers),
+                            mp_context=args.mp_context,
+                            allow_worker_tensor_cache=bool(args.allow_worker_tensor_cache))
     dm.setup()
+
+    # Log effective settings
+    try:
+        sharing = None
+        try:
+            sharing = mp.get_sharing_strategy()
+        except Exception:
+            sharing = "unknown"
+        print(f"[runtime] TMPDIR={os.environ.get('TMPDIR', '')} sharing={sharing} num_workers={args.num_workers} "
+              f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))} "
+              f"cache_dir={args.cache_dir} cache_in_mem={args.cache_in_mem} cache_z_in_mem={int(bool(args.cache_z_in_mem))}")
+    except Exception:
+        pass
+
+    if cache_build_only:
+        # Walk datasets to materialize on-disk caches without training
+        def _walk(ds, name: str) -> None:
+            if ds is None:
+                return
+            n = len(ds)
+            print(f"[cache-build] Building cache for {name}: {n} items")
+            for i in range(n):
+                try:
+                    _ = ds[i]
+                except Exception as e:
+                    print(f"[cache-build] {name} item {i} failed: {e!r}")
+                if (i + 1) % 100 == 0 or (i + 1) == n:
+                    print(f"[cache-build] {name}: {i+1}/{n}")
+        _walk(dm.train_ds, "train")
+        _walk(dm.val_ds, "val")
+        _walk(dm.test_ds, "test")
+        print("[cache-build] Done. Exiting (epochs==0)")
+        return
 
     # If we're only refreshing the prefilter cache, summarize and exit early
     if args.prefilter_cache_refresh:
@@ -210,6 +287,26 @@ def main() -> None:
         mc,
         EarlyStopping(monitor="val/r_by_tf_mean", mode="max", patience=max(5, args.epochs // 10), min_delta=0.002),
     ]
+    # Optional FD monitor callback
+    if int(getattr(args, "fd_monitor_interval", 0) or 0) > 0:
+        try:
+            import psutil  # type: ignore
+            class FDMonitor(pl.Callback):
+                def __init__(self, interval: int) -> None:
+                    super().__init__()
+                    self.interval = max(1, int(interval))
+                    self.proc = psutil.Process()
+                def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx: int) -> None:  # type: ignore[override]
+                    step = int(getattr(trainer, "global_step", 0))
+                    if step % self.interval == 0:
+                        try:
+                            fds = int(self.proc.num_fds())
+                            print(f"[fd-monitor] step={step} open_fds={fds}")
+                        except Exception:
+                            pass
+            callbacks.append(FDMonitor(int(args.fd_monitor_interval)))
+        except Exception:
+            pass
     logger_obj = None
     if args.wandb:
         os.makedirs(args.wandb_dir, exist_ok=True)

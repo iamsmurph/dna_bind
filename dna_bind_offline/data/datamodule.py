@@ -67,7 +67,10 @@ class AffinityDataModule(pl.LightningDataModule):
                  prefilter_cache_off: bool = False,
                  prefilter_workers: int = 8,
                  prefilter_progress: bool = True,
-                 prefilter_verbose: bool = False) -> None:
+                 prefilter_verbose: bool = False,
+                 allow_worker_tensor_cache: bool = False,
+                 persistent_workers: bool = False,
+                 mp_context: str = "default") -> None:
         super().__init__()
         self.labels_csv = labels_csv
         self.pred_glob = pred_glob
@@ -101,10 +104,18 @@ class AffinityDataModule(pl.LightningDataModule):
         self.val_ds: Optional[AffinityDataset] = None
         self.test_ds: Optional[AffinityDataset] = None
         self.train_stats: Dict[str, Tuple[float, float]] = {}
+        self.allow_worker_tensor_cache = bool(allow_worker_tensor_cache)
+        self.persistent_workers = bool(persistent_workers)
+        self.mp_context = mp_context
 
         # Pipeline assumes single-sample batches due to single_collate; guard against silent misuse
         if self.batch_size != 1:
             raise ValueError("This pipeline currently assumes batch_size=1 due to single_collate; got batch_size!=1")
+
+        # Guard against worker-side in-memory caching which can exhaust FDs
+        if self.num_workers > 0 and self.cache_in_mem > 0 and not self.allow_worker_tensor_cache:
+            print("[dataset] Disabling in-memory cache because num_workers>0 to avoid FD exhaustion")
+            self.cache_in_mem = 0
 
     def prepare_data(self) -> None:
         # Place for one-time, rank-0 work (e.g., building/refreshing prefilter index on disk)
@@ -523,7 +534,9 @@ class AffinityDataModule(pl.LightningDataModule):
                       num_workers=self.num_workers,
                       collate_fn=single_collate,
                       pin_memory=self.pin_memory,
-                      persistent_workers=self.num_workers > 0)
+                      persistent_workers=(self.persistent_workers and self.num_workers > 0))
+        if self.num_workers > 0 and self.mp_context and self.mp_context != "default":
+            kwargs["multiprocessing_context"] = self.mp_context
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = self.prefetch_factor
         return torch.utils.data.DataLoader(self.train_ds, **kwargs)
@@ -535,7 +548,9 @@ class AffinityDataModule(pl.LightningDataModule):
                       num_workers=self.num_workers,
                       collate_fn=single_collate,
                       pin_memory=self.pin_memory,
-                      persistent_workers=self.num_workers > 0)
+                      persistent_workers=(self.persistent_workers and self.num_workers > 0))
+        if self.num_workers > 0 and self.mp_context and self.mp_context != "default":
+            kwargs["multiprocessing_context"] = self.mp_context
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = self.prefetch_factor
         return torch.utils.data.DataLoader(self.val_ds, **kwargs)
@@ -548,7 +563,9 @@ class AffinityDataModule(pl.LightningDataModule):
                       num_workers=self.num_workers,
                       collate_fn=single_collate,
                       pin_memory=self.pin_memory,
-                      persistent_workers=self.num_workers > 0)
+                      persistent_workers=(self.persistent_workers and self.num_workers > 0))
+        if self.num_workers > 0 and self.mp_context and self.mp_context != "default":
+            kwargs["multiprocessing_context"] = self.mp_context
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = self.prefetch_factor
         return torch.utils.data.DataLoader(self.test_ds, **kwargs)
