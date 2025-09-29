@@ -87,11 +87,11 @@ class AffinityDataset:
     @staticmethod
     def _to_pinned_half(x: np.ndarray) -> torch.Tensor:
         t = torch.from_numpy(np.asarray(x))
-        return t.to(torch.float16).pin_memory()
+        return t.to(torch.float16).contiguous()
 
     @staticmethod
     def _to_pinned_long(x: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(np.asarray(x, dtype=np.int64)).pin_memory()
+        return torch.from_numpy(np.asarray(x, dtype=np.int64)).contiguous()
 
     def _cache_key_for_dir(self, d: str, bundle_meta: Dict[str, object]) -> str:
         import hashlib
@@ -236,11 +236,11 @@ class AffinityDataset:
             centers = torch.linspace(float(self.rbf_min), float(self.rbf_max), steps=int(self.rbf_centers), dtype=D.dtype)
             phi = torch.exp(-0.5 * ((D[:, None] - centers[None, :]) / max(1e-8, float(self.rbf_sigma))) ** 2)
             phi = phi / (phi.sum(dim=1, keepdim=True) + 1e-8)
-            dist_bins_t = phi.to(torch.float16).pin_memory()
+            dist_bins_t = phi.to(torch.float16).contiguous()
         else:
             from ..geometry.distance_features import build_dist_bins as _build_bins
             dist_bins_np = _build_bins(masks.rep_xyz_crop)
-            dist_bins_t = torch.from_numpy(dist_bins_np).to(torch.float16).pin_memory()
+            dist_bins_t = torch.from_numpy(dist_bins_np).to(torch.float16).contiguous()
 
         c_t = self._to_pinned_half(contact_pd_np) if isinstance(contact_pd_np, np.ndarray) and contact_pd_np.size else None
         pae_t = self._to_pinned_half(pae_pd_np) if isinstance(pae_pd_np, np.ndarray) and pae_pd_np.size else None

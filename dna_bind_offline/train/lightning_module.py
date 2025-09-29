@@ -102,7 +102,7 @@ class AffinityLightningModule(pl.LightningModule):
         y_raw = batch.y.detach().cpu().reshape(()).item()
         self.val_store.setdefault(uniprot, []).append((y_raw, yhat_raw))
         mse = torch.tensor((yhat_raw - y_raw) ** 2, dtype=torch.float32)
-        self.log("val/mse_point", mse, on_step=False, on_epoch=True, prog_bar=False, sync_dist=False, batch_size=1)
+        self.log("val/mse_point", mse, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=1)
 
     def on_validation_epoch_start(self) -> None:
         self.val_store = {}
@@ -172,14 +172,14 @@ class AffinityLightningModule(pl.LightningModule):
         s_median = float(np.median(per_tf_s)) if per_tf_s else float("nan")
         mae_mean = float(np.mean(per_tf_mae)) if per_tf_mae else float("nan")
         r2_mean = float(np.mean(per_tf_r2)) if per_tf_r2 else float("nan")
-        self.log("val/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/num_tfs", torch.tensor(len(self.val_store)), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/num_tfs", torch.tensor(len(self.val_store), dtype=torch.float32), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
     def test_step(self, batch: Sample, batch_idx: int) -> None:
         y = batch.y.to(self.device).reshape(1)
@@ -231,13 +231,13 @@ class AffinityLightningModule(pl.LightningModule):
         s_median = float(np.median(per_tf_s)) if per_tf_s else float("nan")
         mae_mean = float(np.mean(per_tf_mae)) if per_tf_mae else float("nan")
         r2_mean = float(np.mean(per_tf_r2)) if per_tf_r2 else float("nan")
-        self.log("test/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("test/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("test/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/r_by_tf_mean", torch.tensor(r_mean), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("test/spearman_by_tf_mean", torch.tensor(s_mean), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("test/nmse_by_tf_mean", torch.tensor(nmse_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("test/r_by_tf_median", torch.tensor(r_median), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("test/spearman_by_tf_median", torch.tensor(s_median), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("test/mae_by_tf_mean", torch.tensor(mae_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("test/r2_by_tf_mean", torch.tensor(r2_mean), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
     def configure_optimizers(self):
         use_fused = torch.cuda.is_available()

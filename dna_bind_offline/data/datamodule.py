@@ -34,14 +34,9 @@ def read_labels(csv_path: str, seq_col: str = "nt") -> Dict[Tuple[str, str], flo
 
 
 def single_collate(batch: List[Sample]) -> Sample:
-    sample = batch[0]
-    # Ensure pinned host memory for faster H2D copies when using CUDA
-    try:
-        if torch.cuda.is_available():
-            return sample.pin_memory()
-    except Exception:
-        pass
-    return sample
+    # Return the Sample as-is. When pin_memory=True, DataLoader will pin this
+    # object in the main process by calling its .pin_memory() method.
+    return batch[0]
 
 
 class AffinityDataModule(pl.LightningDataModule):
