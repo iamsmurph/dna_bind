@@ -55,15 +55,17 @@ def load_npz_safely(path: Optional[str]) -> Optional[np.ndarray]:
     if not path:
         return None
     try:
-        data = np.load(path)
-        # Try common keys, else first array
-        for key in ("contact_probs", "arr_0"):
-            if key in data:
-                arr = data[key]
-                break
-        else:
-            arr = data[data.files[0]]
-        arr = np.asarray(arr)
+        # Ensure the NPZ file handle is closed promptly
+        with np.load(path) as data:
+            # Try common keys, else first array
+            if "contact_probs" in data:
+                arr = data["contact_probs"]
+            elif "arr_0" in data:
+                arr = data["arr_0"]
+            else:
+                arr = data[data.files[0]]
+            # Copy to detach from the underlying mmap/file handle
+            arr = np.asarray(arr).copy()
         # Symmetrize if near-symmetric expected (warn-silent if notably asymmetric)
         if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
             if not np.allclose(arr, arr.T, atol=1e-3):

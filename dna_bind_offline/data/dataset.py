@@ -147,14 +147,15 @@ class AffinityDataset:
         pde_pd_np = None
         dist_pd_np = None
         if have_cache:
-            data = np.load(cache_path)
-            L_arr = data.get("L")
-            pd_pairs_np = data.get("pd_pairs")
-            pd_flat_idx_np = data.get("pd_flat_idx")
-            dist_pd_np = data.get("dist_rbf_pd")
-            contact_pd_np = data.get("contact_pd")
-            pae_pd_np = data.get("pae_pd")
-            pde_pd_np = data.get("pde_pd")
+            # Ensure NPZ is closed promptly; copy arrays to detach from file
+            with np.load(cache_path) as data:
+                L_arr = (data["L"].copy() if "L" in data else None)
+                pd_pairs_np = (data["pd_pairs"].copy() if "pd_pairs" in data else None)
+                pd_flat_idx_np = (data["pd_flat_idx"].copy() if "pd_flat_idx" in data else None)
+                dist_pd_np = (data["dist_rbf_pd"].copy() if "dist_rbf_pd" in data else None)
+                contact_pd_np = (data["contact_pd"].copy() if "contact_pd" in data else None)
+                pae_pd_np = (data["pae_pd"].copy() if "pae_pd" in data else None)
+                pde_pd_np = (data["pde_pd"].copy() if "pde_pd" in data else None)
             if isinstance(dist_pd_np, np.ndarray) and isinstance(pd_pairs_np, np.ndarray) and isinstance(L_arr, np.ndarray):
                 Lc = int(L_arr.reshape(-1)[0])
                 aff_mask = np.zeros((Lc, Lc), dtype=bool)
